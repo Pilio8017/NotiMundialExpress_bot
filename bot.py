@@ -13,7 +13,7 @@ logging.basicConfig(
 )
 
 # Tu Token real de BotFather integrado correctamente
-TOKEN = "9035646731:AAFyKvhEcFhNZCE7l6tBoCgeMSQfgYOlQts"
+TOKEN = "9035646731:AAF2hfQN9stP3_enhLRuM0Y9DXhcP4lvD8c"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
