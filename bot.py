@@ -1,4 +1,5 @@
 import logging
+import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -12,8 +13,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# Tu Token real de BotFather integrado correctamente
-TOKEN = "9035646731:AAF2hfQN9stP3_enhLRuM0Y9DXhcP4lvD8c"
+# Lee el token de manera segura desde las variables de entorno de Render
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
