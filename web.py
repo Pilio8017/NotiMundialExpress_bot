@@ -1,20 +1,18 @@
 import os
-import threading
-from flask import Flask
+from flask import Flask, request
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# 1. Configuración de Flask para Render (mantiene el servicio en verde)
 app = Flask(__name__)
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
+PORT = int(os.environ.get("PORT", 10000))
+# Tu URL pública de Render
+URL = "https://notimundialexpress-bot.onrender.com"
+
+# Construir la aplicación de Telegram sin polling
+application = None
 
 
-@app.route("/")
-def home():
-  return "¡El Noticiero Mundial Express Bot está activo y funcionando!"
-
-
-# 2. Lógica y comandos del Bot de Telegram
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
   await update.message.reply_text(
       "¡Bienvenido a tu Noticiero Inteligente! 📰\nEscribe /noticias, /cine,"
@@ -56,31 +54,46 @@ async def ayuda_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
   )
 
 
-def run_telegram_bot():
-  """Arranca el bot de Telegram en segundo plano de manera persistente"""
+def init_bot():
+  global application
   if not TOKEN:
-    print("Error: TELEGRAM_TOKEN no está configurado.")
-    return
+    return None
+  app_builder = ApplicationBuilder().token(TOKEN).build()
+  app_builder.add_handler(CommandHandler("start", start))
+  app_builder.add_handler(CommandHandler("noticias", noticias_command))
+  app_builder.add_handler(CommandHandler("cine", cine_command))
+  app_builder.add_handler(CommandHandler("mercados", mercados_command))
+  app_builder.add_handler(CommandHandler("deportes", deportes_command))
+  app_builder.add_handler(CommandHandler("ayuda", ayuda_command))
+  return app_builder
 
-  application = ApplicationBuilder().token(TOKEN).build()
 
-  # Registro de comandos
-  application.add_handler(CommandHandler("start", start))
-  application.add_handler(CommandHandler("noticias", noticias_command))
-  application.add_handler(CommandHandler("cine", cine_command))
-  application.add_handler(CommandHandler("mercados", mercados_command))
-  application.add_handler(CommandHandler("deportes", deportes_command))
-  application.add_handler(CommandHandler("ayuda", ayuda_command))
+@app.route("/")
+def home():
+  return "¡El Noticiero Mundial Express Bot está activo con Webhooks!"
 
-  print("Iniciando sondeo de Telegram en hilo secundario...")
-  application.run_polling(drop_pending_updates=True)
+
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+  """Recibe los mensajes que envía Telegram y los procesa"""
+  global application
+  if application:
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    # Ejecutamos el procesamiento de la actualización de forma asíncrona o directa
+    import asyncio
+
+    asyncio.run(application.process_update(update))
+  return "ok", 200
 
 
 if __name__ == "__main__":
-  # Lanzamos el bot de Telegram en un hilo independiente para que no bloquee el puerto web
-  bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
-  bot_thread.start()
+  application = init_bot()
+  if application:
+    # Configuramos el Webhook en Telegram automáticamente al arrancar
+    import asyncio
 
-  # Iniciamos Flask en el puerto que exige Render
-  port = int(os.environ.get("PORT", 10000))
-  app.run(host="0.0.0.0", port=port)
+    asyncio.run(application.initialize())
+    asyncio.run(application.bot.set_webhook(url=f"{URL}/{TOKEN}"))
+    print("Webhook configurado exitosamente en Telegram.")
+
+  app.run(host="0.0.0.0", port=PORT)
