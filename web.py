@@ -188,7 +188,7 @@ def descargar_url(url, timeout=12):
 
 
 # =========================================================
-# ABRIR PÁGINA ORIGINAL Y RESOLVER REDIRECCIONES
+# ABRIR PÁGINA ORIGINAL
 # =========================================================
 
 def descargar_pagina_original(url, timeout=15):
@@ -199,7 +199,7 @@ def descargar_pagina_original(url, timeout=15):
             url,
             headers={
                 "User-Agent": USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml",
+                "Accept": "text/html,application/xhtml+xml,*/*",
             },
         )
 
@@ -208,7 +208,10 @@ def descargar_pagina_original(url, timeout=15):
             timeout=timeout
         ) as respuesta:
 
-            contenido = respuesta.read(4 * 1024 * 1024)
+            contenido = respuesta.read(
+                4 * 1024 * 1024
+            )
+
             url_final = respuesta.geturl()
 
             return contenido, url_final
@@ -224,7 +227,7 @@ def descargar_pagina_original(url, timeout=15):
 
 
 # =========================================================
-# DESCARTAR LOGOTIPOS E IMÁGENES GENÉRICAS
+# FILTRO DE IMÁGENES GENÉRICAS
 # =========================================================
 
 def imagen_es_generica(url):
@@ -235,47 +238,29 @@ def imagen_es_generica(url):
 
         dominio = partes.netloc.lower()
         ruta = partes.path.lower()
-        texto_completo = (ruta + " " + partes.query).lower()
 
-        dominios_bloqueados = [
-            "news.google.com",
-            "gstatic.com",
-            "google.com",
-            "googleapis.com",
-        ]
+        # Bloquear el dominio del RSS de Google News,
+        # pero no otros servidores de Google.
 
-        for dominio_bloqueado in dominios_bloqueados:
-
-            if (
-                dominio == dominio_bloqueado
-                or dominio.endswith("." + dominio_bloqueado)
-            ):
-                return True
+        if dominio == "news.google.com":
+            return True
 
         palabras_bloqueadas = [
-            "logo",
-            "icon",
             "favicon",
-            "avatar",
             "placeholder",
-            "default",
             "no-image",
             "noimage",
+            "default-avatar",
             "social-icon",
-            "profile",
-            "sprite",
-            "brand",
         ]
 
         if any(
-            palabra in texto_completo
+            palabra in ruta
             for palabra in palabras_bloqueadas
         ):
             return True
 
-        extension = ruta.rsplit(".", 1)[-1]
-
-        if extension in ["svg", "ico"]:
+        if ruta.endswith((".svg", ".ico")):
             return True
 
         return False
@@ -408,33 +393,23 @@ def descargar_imagen(url):
             url,
             headers={
                 "User-Agent": USER_AGENT,
-                "Accept": "image/*",
+                "Accept": (
+                    "image/avif,image/webp,image/apng,"
+                    "image/svg+xml,image/*,*/*;q=0.8"
+                ),
             },
         )
 
         with urllib.request.urlopen(
             solicitud,
-            timeout=12
+            timeout=15
         ) as respuesta:
-
-            tipo = respuesta.headers.get(
-                "Content-Type",
-                ""
-            ).lower()
-
-            if "image" not in tipo:
-                return None
 
             datos = respuesta.read(
                 MAX_IMAGE_BYTES + 1
             )
 
             if not datos or len(datos) > MAX_IMAGE_BYTES:
-
-                logger.warning(
-                    "Imagen descartada por superar el límite."
-                )
-
                 return None
 
             return datos
@@ -450,7 +425,7 @@ def descargar_imagen(url):
 
 
 # =========================================================
-# VALIDAR QUE SEA UNA FOTOGRAFÍA REAL
+# VALIDAR FOTOGRAFÍA
 # =========================================================
 
 def descargar_fotografia_valida(url):
@@ -465,29 +440,38 @@ def descargar_fotografia_valida(url):
 
     try:
 
-        imagen = Image.open(BytesIO(datos))
+        imagen = Image.open(
+            BytesIO(datos)
+        )
 
         ancho, alto = imagen.size
 
-        if ancho < 320 or alto < 180:
-            return None
-
-        proporcion = ancho / alto
-
-        if proporcion < 0.45 or proporcion > 2.8:
+        # Aceptar fotografías de diferentes tamaños.
+        if ancho < 100 or alto < 100:
             return None
 
         imagen.verify()
 
+        logger.info(
+            "Fotografía válida detectada: %s x %s",
+            ancho,
+            alto
+        )
+
         return datos
 
-    except Exception:
+    except Exception as e:
+
+        logger.info(
+            "Imagen descartada porque no es válida: %s",
+            e
+        )
 
         return None
 
 
 # =========================================================
-# CONVERTIR Y OPTIMIZAR IMAGEN PARA TELEGRAM
+# OPTIMIZAR IMAGEN PARA TELEGRAM
 # =========================================================
 
 def preparar_imagen_telegram(datos):
@@ -558,11 +542,6 @@ def preparar_imagen_telegram(datos):
             return None
 
         if len(resultado) > MAX_TELEGRAM_PHOTO_BYTES:
-
-            logger.warning(
-                "Imagen todavía supera el tamaño permitido."
-            )
-
             return None
 
         logger.info(
@@ -621,7 +600,7 @@ def buscar_imagen_original(noticia):
             parser = ImageParser()
             parser.feed(texto_html)
 
-            # Primero las imágenes de la página original.
+            # Primero las imágenes de la publicación.
             candidatos.extend(parser.imagenes)
 
         except Exception as e:
@@ -631,7 +610,7 @@ def buscar_imagen_original(noticia):
                 e
             )
 
-    # Las imágenes del RSS quedan como segunda opción.
+    # Después revisar las imágenes disponibles en RSS.
     candidatos.extend(
         noticia.get("imagenes", [])
     )
@@ -661,13 +640,12 @@ def buscar_imagen_original(noticia):
             continue
 
         if imagen_es_generica(imagen):
-
-            logger.info(
-                "Imagen genérica descartada: %s",
-                imagen[:150]
-            )
-
             continue
+
+        logger.info(
+            "Probando fotografía: %s",
+            imagen[:180]
+        )
 
         datos = descargar_fotografia_valida(
             imagen
@@ -676,13 +654,13 @@ def buscar_imagen_original(noticia):
         if datos:
 
             logger.info(
-                "Fotografía válida encontrada en la publicación original."
+                "Fotografía encontrada en la publicación original."
             )
 
             return datos
 
     logger.info(
-        "No se encontró fotografía válida en la publicación original."
+        "No se encontró fotografía en la publicación original."
     )
 
     return None
@@ -750,12 +728,6 @@ def buscar_imagen_commons(titulo):
         )
 
         if not paginas:
-
-            logger.info(
-                "Commons no encontró imágenes para: %s",
-                consulta
-            )
-
             return None
 
         for pagina in paginas.values():
@@ -771,7 +743,6 @@ def buscar_imagen_commons(titulo):
                     "logo",
                     "icon",
                     "favicon",
-                    "flag",
                     "symbol",
                     "default",
                     "avatar",
@@ -871,7 +842,6 @@ def buscar_imagen_commons(titulo):
 
 def buscar_fotografia(noticia):
 
-    # Primera opción: fotografía de la publicación original.
     imagen_original = buscar_imagen_original(
         noticia
     )
@@ -885,9 +855,8 @@ def buscar_fotografia(noticia):
             ),
         }
 
-    # Segunda opción: Wikimedia Commons.
     logger.info(
-        "No hay fotografía original. Buscando alternativa..."
+        "Buscando fotografía alternativa en Wikimedia Commons."
     )
 
     imagen_alternativa = buscar_imagen_commons(
@@ -898,7 +867,7 @@ def buscar_fotografia(noticia):
         return imagen_alternativa
 
     logger.info(
-        "No se encontró una fotografía adecuada."
+        "No se encontró una fotografía disponible."
     )
 
     return None
@@ -981,10 +950,6 @@ def generar_resumen(titulo, descripcion, fuente):
 
         if not candidatos:
 
-            logger.warning(
-                "Gemini respondió sin candidatos."
-            )
-
             return descripcion[:450] if descripcion else (
                 "No fue posible generar el resumen."
             )
@@ -1021,7 +986,7 @@ def generar_resumen(titulo, descripcion, fuente):
             detalle = str(e)
 
         logger.error(
-            "ERROR DETALLADO DE GEMINI - HTTP %s: %s",
+            "ERROR DE GEMINI - HTTP %s: %s",
             e.code,
             detalle
         )
