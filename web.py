@@ -10,9 +10,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import hmac
 
 from html.parser import HTMLParser
 from io import BytesIO
+
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from flask import Flask, request
 from telegram import Update, InputFile
@@ -69,9 +72,14 @@ USER_AGENT = (
     "NoticieroMundialExpress/1.0)"
 )
 
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_TELEGRAM_PHOTO_BYTES = 9 * 1024 * 1024
+MAX_CAPTION_LENGTH = 1024
+
 # Evitar actualizaciones duplicadas.
 processed_update_ids = set()
 update_lock = threading.Lock()
+
 
 # =========================================================
 # LIMPIAR TEXTO
@@ -320,10 +328,13 @@ def descargar_imagen(url):
                 return None
 
             datos = respuesta.read(
-                5 * 1024 * 1024 + 1
+                MAX_IMAGE_BYTES + 1
             )
 
-            if not datos or len(datos) > 5 * 1024 * 1024:
+            if not datos or len(datos) > MAX_IMAGE_BYTES:
+                logger.warning(
+                    "Imagen descartada por superar el límite de descarga."
+                )
                 return None
 
             return datos
@@ -332,6 +343,136 @@ def descargar_imagen(url):
 
         logger.warning(
             "No se pudo descargar imagen: %s",
+            e
+        )
+
+        return None
+
+
+# =========================================================
+# CONVERTIR Y OPTIMIZAR IMAGEN PARA TELEGRAM
+# =========================================================
+
+def preparar_imagen_telegram(datos):
+
+    if not datos:
+        return None
+
+    try:
+
+        imagen_original = Image.open(
+            BytesIO(datos)
+        )
+
+        # Corregir orientación según los metadatos EXIF.
+        imagen = ImageOps.exif_transpose(
+            imagen_original
+        )
+
+        # Evitar imágenes excesivamente grandes.
+        imagen.thumbnail(
+            (1600, 1600),
+            Image.Resampling.LANCZOS
+        )
+
+        # Convertir transparencias a fondo blanco.
+        if imagen.mode in ("RGBA", "LA"):
+
+            imagen = imagen.convert("RGBA")
+
+            fondo = Image.new(
+                "RGB",
+                imagen.size,
+                (255, 255, 255)
+            )
+
+            fondo.paste(
+                imagen,
+                mask=imagen.getchannel("A")
+            )
+
+            imagen = fondo
+
+        elif imagen.mode == "P":
+
+            imagen = imagen.convert("RGBA")
+
+            fondo = Image.new(
+                "RGB",
+                imagen.size,
+                (255, 255, 255)
+            )
+
+            fondo.paste(
+                imagen,
+                mask=imagen.getchannel("A")
+            )
+
+            imagen = fondo
+
+        else:
+
+            imagen = imagen.convert("RGB")
+
+        # Generar JPG optimizado.
+        salida = BytesIO()
+
+        calidad = 88
+
+        while calidad >= 45:
+
+            salida.seek(0)
+            salida.truncate(0)
+
+            imagen.save(
+                salida,
+                format="JPEG",
+                quality=calidad,
+                optimize=True
+            )
+
+            if salida.tell() <= MAX_TELEGRAM_PHOTO_BYTES:
+                break
+
+            calidad -= 10
+
+        resultado = salida.getvalue()
+
+        if not resultado:
+            return None
+
+        if len(resultado) > MAX_TELEGRAM_PHOTO_BYTES:
+
+            logger.warning(
+                "Imagen todavía supera el tamaño permitido."
+            )
+
+            return None
+
+        logger.info(
+            "Imagen optimizada para Telegram: %s bytes.",
+            len(resultado)
+        )
+
+        return resultado
+
+    except (
+        UnidentifiedImageError,
+        OSError,
+        ValueError
+    ) as e:
+
+        logger.warning(
+            "No se pudo convertir la imagen: %s",
+            e
+        )
+
+        return None
+
+    except Exception as e:
+
+        logger.exception(
+            "Error inesperado optimizando imagen: %s",
             e
         )
 
@@ -423,7 +564,6 @@ def buscar_imagen_commons(titulo):
 
     consulta = titulo
 
-    # Eliminar el nombre del medio cuando viene al final.
     if " - " in consulta:
         consulta = consulta.rsplit(" - ", 1)[0]
 
@@ -476,10 +616,12 @@ def buscar_imagen_commons(titulo):
         )
 
         if not paginas:
+
             logger.info(
                 "Commons no encontró imágenes para: %s",
                 consulta
             )
+
             return None
 
         for pagina in paginas.values():
@@ -496,8 +638,6 @@ def buscar_imagen_commons(titulo):
 
             mime = info.get("mime", "").lower()
 
-            # Evitar SVG, documentos y otros formatos
-            # que Telegram no siempre procesa correctamente.
             if mime not in [
                 "image/jpeg",
                 "image/png",
@@ -537,7 +677,6 @@ def buscar_imagen_commons(titulo):
                 )
             )
 
-            # Usar miniatura optimizada cuando esté disponible.
             url_imagen = (
                 info.get("thumburl")
                 or info.get("url")
@@ -581,7 +720,6 @@ def buscar_imagen_commons(titulo):
 
 def buscar_fotografia(noticia):
 
-    # NIVEL 1: imagen de la publicación original.
     imagen_original = buscar_imagen_original(
         noticia
     )
@@ -599,16 +737,13 @@ def buscar_fotografia(noticia):
         "No hay fotografía original. Buscando alternativa..."
     )
 
-    # NIVEL 2: imagen relacionada en Wikimedia Commons.
     imagen_alternativa = buscar_imagen_commons(
         noticia["titulo"]
     )
 
     if imagen_alternativa:
-
         return imagen_alternativa
 
-    # NIVEL 3: no utilizar una fotografía sin relación comprobable.
     logger.info(
         "No se encontró una fotografía adecuada."
     )
@@ -795,6 +930,148 @@ def crear_mensaje(noticia, resumen, credito=None):
 
 
 # =========================================================
+# ENVIAR FOTOGRAFÍA Y TEXTO
+# =========================================================
+
+async def enviar_fotografia_y_texto(chat, fotografia, mensaje):
+
+    # Primero convertir la imagen a JPG compatible.
+    imagen_jpg = await asyncio.to_thread(
+        preparar_imagen_telegram,
+        fotografia["datos"]
+    )
+
+    if not imagen_jpg:
+
+        logger.warning(
+            "La imagen no pudo convertirse. Se enviará solo el texto."
+        )
+
+        await chat.send_message(
+            mensaje,
+            parse_mode="HTML",
+            disable_web_page_preview=False
+        )
+
+        return False
+
+    # Si el texto completo cabe en el caption, enviarlo junto con la foto.
+    if len(mensaje) <= MAX_CAPTION_LENGTH:
+
+        try:
+
+            await chat.send_photo(
+                photo=InputFile(
+                    BytesIO(imagen_jpg),
+                    filename="noticia.jpg"
+                ),
+                caption=mensaje,
+                parse_mode="HTML",
+                read_timeout=40,
+                write_timeout=40,
+                connect_timeout=20,
+                pool_timeout=20
+            )
+
+            logger.info(
+                "Fotografía enviada correctamente con su descripción."
+            )
+
+            return True
+
+        except Exception as e:
+
+            logger.exception(
+                "FALLO REAL AL ENVIAR FOTOGRAFÍA CON CAPTION: %s",
+                e
+            )
+
+            # Intentar nuevamente sin caption.
+            try:
+
+                await chat.send_photo(
+                    photo=InputFile(
+                        BytesIO(imagen_jpg),
+                        filename="noticia.jpg"
+                    ),
+                    read_timeout=40,
+                    write_timeout=40,
+                    connect_timeout=20,
+                    pool_timeout=20
+                )
+
+                logger.info(
+                    "Fotografía enviada sin caption. Enviando texto separado."
+                )
+
+                await chat.send_message(
+                    mensaje,
+                    parse_mode="HTML",
+                    disable_web_page_preview=False
+                )
+
+                return True
+
+            except Exception as segundo_error:
+
+                logger.exception(
+                    "FALLO AL ENVIAR FOTOGRAFÍA SIN CAPTION: %s",
+                    segundo_error
+                )
+
+                await chat.send_message(
+                    mensaje,
+                    parse_mode="HTML",
+                    disable_web_page_preview=False
+                )
+
+                return False
+
+    # Si el mensaje supera 1024 caracteres, enviar foto y texto separados.
+    try:
+
+        await chat.send_photo(
+            photo=InputFile(
+                BytesIO(imagen_jpg),
+                filename="noticia.jpg"
+            ),
+            caption="🌎 <b>Fotografía de la noticia</b>",
+            parse_mode="HTML",
+            read_timeout=40,
+            write_timeout=40,
+            connect_timeout=20,
+            pool_timeout=20
+        )
+
+        logger.info(
+            "Fotografía enviada. El texto se enviará por separado."
+        )
+
+        await chat.send_message(
+            mensaje,
+            parse_mode="HTML",
+            disable_web_page_preview=False
+        )
+
+        return True
+
+    except Exception as e:
+
+        logger.exception(
+            "FALLO AL ENVIAR FOTOGRAFÍA: %s",
+            e
+        )
+
+        await chat.send_message(
+            mensaje,
+            parse_mode="HTML",
+            disable_web_page_preview=False
+        )
+
+        return False
+
+
+# =========================================================
 # ENVIAR NOTICIAS
 # =========================================================
 
@@ -867,28 +1144,24 @@ async def enviar_noticias(update, titulo, consulta):
 
                 if fotografia:
 
-                    try:
+                    foto_enviada = await enviar_fotografia_y_texto(
+                        chat,
+                        fotografia,
+                        mensaje
+                    )
 
-                        await chat.send_photo(
-                            photo=InputFile(
-                                BytesIO(fotografia["datos"]),
-                                filename="noticia.jpg"
-                            ),
-                            caption=mensaje,
-                            parse_mode="HTML"
+                    if foto_enviada:
+
+                        logger.info(
+                            "Noticia %s enviada con fotografía.",
+                            numero
                         )
 
-                    except Exception as e:
+                    else:
 
                         logger.warning(
-                            "Error enviando fotografía: %s",
-                            e
-                        )
-
-                        await chat.send_message(
-                            mensaje,
-                            parse_mode="HTML",
-                            disable_web_page_preview=False
+                            "Noticia %s enviada sin fotografía.",
+                            numero
                         )
 
                 else:
@@ -899,10 +1172,10 @@ async def enviar_noticias(update, titulo, consulta):
                         disable_web_page_preview=False
                     )
 
-                logger.info(
-                    "Noticia %s enviada correctamente.",
-                    numero
-                )
+                    logger.info(
+                        "Noticia %s enviada sin fotografía disponible.",
+                        numero
+                    )
 
             except Exception as e:
 
@@ -1068,8 +1341,6 @@ async def inicializar_bot():
 # =========================================================
 
 def hmac_comparar(valor1, valor2):
-
-    import hmac
 
     return hmac.compare_digest(
         str(valor1),
