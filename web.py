@@ -28,11 +28,16 @@ from telegram.ext import (
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.environ.get(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash"
+)
 
 URL = "https://notimundialexpress-bot.onrender.com"
 WEBHOOK_URL = f"{URL}/webhook"
+
 PORT = int(os.environ.get("PORT", 10000))
 
 if not TOKEN:
@@ -50,13 +55,12 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# Evita que los logs HTTP muestren URLs que puedan contener
-# información sensible, como el token de Telegram.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
 application = None
 event_loop = None
 
@@ -65,11 +69,16 @@ USER_AGENT = (
     "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
 )
 
+# Evitar actualizaciones duplicadas de Telegram.
+processed_update_ids = set()
+update_lock = threading.Lock()
+
 # =========================================================
-# LIMPIEZA DE TEXTO HTML
+# LIMPIAR TEXTO HTML
 # =========================================================
 
 def limpiar_html(texto):
+
     if not texto:
         return ""
 
@@ -107,6 +116,7 @@ class ImageParser(HTMLParser):
                 "twitter:image",
                 "twitter:image:src",
             ]:
+
                 imagen = atributos.get("content")
 
                 if imagen:
@@ -126,9 +136,9 @@ class ImageParser(HTMLParser):
             srcset = atributos.get("srcset")
 
             if srcset:
-                partes = srcset.split(",")
 
-                for parte in partes:
+                for parte in srcset.split(","):
+
                     url = parte.strip().split(" ")[0]
 
                     if url:
@@ -160,31 +170,38 @@ def descargar_url(url, timeout=12):
 
     except Exception as e:
 
-        logger.warning("No se pudo descargar contenido: %s", e)
+        logger.warning(
+            "No se pudo descargar contenido web: %s",
+            e
+        )
+
         return None
 
 
 # =========================================================
-# OBTENER FOTOGRAFÍA DE UNA NOTICIA
+# EXTRAER IMÁGENES DEL RSS
 # =========================================================
 
-def buscar_fotografia(item, enlace):
+def extraer_imagenes_rss(item):
 
     candidatos = []
-
-    # 1. Revisar imágenes incluidas directamente en el RSS.
 
     for elemento in item.iter():
 
         etiqueta = elemento.tag.lower()
 
-        if etiqueta.endswith("}content") or etiqueta.endswith("}thumbnail"):
+        # Imágenes de Media RSS.
+        if (
+            etiqueta.endswith("}content")
+            or etiqueta.endswith("}thumbnail")
+        ):
 
             imagen = elemento.attrib.get("url")
 
             if imagen:
                 candidatos.append(imagen)
 
+        # Imágenes de enclosure.
         if etiqueta.endswith("enclosure"):
 
             imagen = elemento.attrib.get("url")
@@ -193,8 +210,7 @@ def buscar_fotografia(item, enlace):
             if imagen and "image" in tipo.lower():
                 candidatos.append(imagen)
 
-    # 2. Revisar imágenes dentro de la descripción RSS.
-
+    # Revisar imágenes dentro de la descripción RSS.
     descripcion = ""
 
     elemento_descripcion = item.find("description")
@@ -202,105 +218,19 @@ def buscar_fotografia(item, enlace):
     if elemento_descripcion is not None:
         descripcion = elemento_descripcion.text or ""
 
-    parser_rss = ImageParser()
+    parser = ImageParser()
 
     try:
-        parser_rss.feed(descripcion)
-        candidatos.extend(parser_rss.imagenes)
+        parser.feed(descripcion)
+        candidatos.extend(parser.imagenes)
     except Exception:
         pass
 
-    # 3. Revisar metadatos de la página original.
-
-    contenido = descargar_url(enlace)
-
-    if contenido:
-
-        try:
-
-            texto_html = contenido.decode(
-                "utf-8",
-                errors="replace"
-            )
-
-            parser_web = ImageParser()
-            parser_web.feed(texto_html)
-
-            candidatos.extend(parser_web.imagenes)
-
-        except Exception as e:
-
-            logger.warning(
-                "No se pudieron analizar imágenes de la página: %s",
-                e
-            )
-
-    # 4. Intentar descargar las imágenes encontradas.
-
-    imagenes_revisadas = set()
-
-    for imagen in candidatos:
-
-        if not imagen:
-            continue
-
-        imagen = html.unescape(imagen.strip())
-
-        imagen = urllib.parse.urljoin(enlace, imagen)
-
-        if imagen in imagenes_revisadas:
-            continue
-
-        imagenes_revisadas.add(imagen)
-
-        if not imagen.startswith(("http://", "https://")):
-            continue
-
-        try:
-
-            solicitud = urllib.request.Request(
-                imagen,
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Accept": "image/*",
-                },
-            )
-
-            with urllib.request.urlopen(
-                solicitud,
-                timeout=10
-            ) as respuesta:
-
-                tipo = respuesta.headers.get(
-                    "Content-Type",
-                    ""
-                )
-
-                if "image" not in tipo.lower():
-                    continue
-
-                datos = respuesta.read(5 * 1024 * 1024 + 1)
-
-                if len(datos) > 5 * 1024 * 1024:
-                    continue
-
-                if not datos:
-                    continue
-
-                return datos
-
-        except Exception as e:
-
-            logger.warning(
-                "No se pudo obtener una imagen: %s",
-                e
-            )
-
-    return None
+    return candidatos
 
 
 # =========================================================
-# CONSULTAR NOTICIAS DE GOOGLE NEWS
+# CONSULTAR GOOGLE NEWS RSS
 # =========================================================
 
 def consultar_rss(consulta, limite=5):
@@ -315,7 +245,10 @@ def consultar_rss(consulta, limite=5):
         "&hl=es-419&gl=CR&ceid=CR:es-419"
     )
 
-    contenido = descargar_url(url, timeout=15)
+    contenido = descargar_url(
+        url,
+        timeout=15
+    )
 
     if not contenido:
         return noticias
@@ -349,13 +282,18 @@ def consultar_rss(consulta, limite=5):
             if not titulo or not enlace:
                 continue
 
+            # IMPORTANTE:
+            # Guardamos las imágenes del XML antes de convertir
+            # la noticia en un diccionario.
+            imagenes = extraer_imagenes_rss(item)
+
             noticias.append({
                 "titulo": titulo,
                 "enlace": enlace,
                 "descripcion": descripcion,
                 "fuente": fuente,
                 "fecha": fecha,
-                "imagen": None,
+                "imagenes": imagenes,
             })
 
     except Exception as e:
@@ -369,7 +307,125 @@ def consultar_rss(consulta, limite=5):
 
 
 # =========================================================
-# GENERAR RESUMEN CON GEMINI
+# BUSCAR Y DESCARGAR FOTOGRAFÍA
+# =========================================================
+
+def buscar_fotografia(noticia, enlace):
+
+    candidatos = []
+
+    # 1. Imágenes guardadas al leer el RSS.
+    candidatos.extend(
+        noticia.get("imagenes", [])
+    )
+
+    # 2. Revisar la página original.
+    contenido = descargar_url(
+        enlace,
+        timeout=12
+    )
+
+    if contenido:
+
+        try:
+
+            texto_html = contenido.decode(
+                "utf-8",
+                errors="replace"
+            )
+
+            parser = ImageParser()
+            parser.feed(texto_html)
+
+            candidatos.extend(parser.imagenes)
+
+        except Exception as e:
+
+            logger.warning(
+                "Error analizando imágenes de la página: %s",
+                e
+            )
+
+    # 3. Descargar las imágenes encontradas.
+    imagenes_revisadas = set()
+
+    for imagen in candidatos:
+
+        if not imagen:
+            continue
+
+        imagen = html.unescape(
+            imagen.strip()
+        )
+
+        imagen = urllib.parse.urljoin(
+            enlace,
+            imagen
+        )
+
+        if imagen in imagenes_revisadas:
+            continue
+
+        imagenes_revisadas.add(imagen)
+
+        if not imagen.startswith(("http://", "https://")):
+            continue
+
+        try:
+
+            solicitud = urllib.request.Request(
+                imagen,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "image/*",
+                },
+            )
+
+            with urllib.request.urlopen(
+                solicitud,
+                timeout=12
+            ) as respuesta:
+
+                tipo = respuesta.headers.get(
+                    "Content-Type",
+                    ""
+                )
+
+                if "image" not in tipo.lower():
+                    continue
+
+                datos = respuesta.read(
+                    5 * 1024 * 1024 + 1
+                )
+
+                if len(datos) > 5 * 1024 * 1024:
+                    continue
+
+                if not datos:
+                    continue
+
+                logger.info(
+                    "Fotografía obtenida correctamente."
+                )
+
+                return datos
+
+        except Exception as e:
+
+            logger.warning(
+                "No se pudo obtener una imagen: %s",
+                e
+            )
+
+    logger.info(
+        "La noticia no tiene una fotografía disponible."
+    )
+
+    return None
+
+
+# =========================================================
+# RESUMEN CON GEMINI
 # =========================================================
 
 def generar_resumen(titulo, descripcion, fuente):
@@ -384,20 +440,16 @@ def generar_resumen(titulo, descripcion, fuente):
             "No hay información suficiente para generar el resumen."
         )
 
-    contexto = (
-        f"Titular: {titulo}\n"
-        f"Descripción disponible: {descripcion}\n"
-        f"Fuente: {fuente}"
-    )
-
     instruccion = (
         "Eres un periodista que resume noticias en español. "
-        "Resume la noticia en un lenguaje sencillo, claro y neutral. "
+        "Resume la noticia en lenguaje sencillo, claro y neutral. "
         "Escribe entre 2 y 4 oraciones cortas. "
         "No inventes datos, fechas, cifras ni declaraciones. "
         "Si la información es insuficiente, indícalo claramente. "
         "No agregues opiniones personales.\n\n"
-        f"{contexto}"
+        f"Titular: {titulo}\n"
+        f"Descripción disponible: {descripcion}\n"
+        f"Fuente: {fuente}"
     )
 
     url = (
@@ -444,9 +496,13 @@ def generar_resumen(titulo, descripcion, fuente):
                 respuesta.read().decode("utf-8")
             )
 
-        candidatos = resultado.get("candidates", [])
+        candidatos = resultado.get(
+            "candidates",
+            []
+        )
 
         if not candidatos:
+
             logger.warning(
                 "Gemini respondió sin candidatos."
             )
@@ -476,14 +532,16 @@ def generar_resumen(titulo, descripcion, fuente):
     except urllib.error.HTTPError as e:
 
         try:
+
             detalle = e.read().decode(
                 "utf-8",
                 errors="replace"
             )
+
         except Exception:
+
             detalle = str(e)
 
-        # No registrar la clave API ni la URL completa.
         logger.error(
             "ERROR DETALLADO DE GEMINI - HTTP %s: %s",
             e.code,
@@ -512,24 +570,32 @@ def generar_resumen(titulo, descripcion, fuente):
 
 def crear_mensaje(noticia, resumen):
 
-    titulo = noticia["titulo"]
-    fuente = noticia["fuente"]
-    enlace = noticia["enlace"]
+    titulo = html.escape(
+        noticia["titulo"]
+    )
+
+    fuente = html.escape(
+        noticia["fuente"]
+    )
+
+    enlace = html.escape(
+        noticia["enlace"],
+        quote=True
+    )
 
     mensaje = (
-        f"🌎 <b>{html.escape(titulo)}</b>\n\n"
+        f"🌎 <b>{titulo}</b>\n\n"
         f"📝 <b>Resumen:</b>\n"
         f"{html.escape(resumen)}\n\n"
-        f"📰 <b>Fuente:</b> {html.escape(fuente)}\n\n"
-        f'🔗 <a href="{html.escape(enlace, quote=True)}">'
-        "Leer noticia completa</a>"
+        f"📰 <b>Fuente:</b> {fuente}\n\n"
+        f'<a href="{enlace}">🔗 Leer noticia completa</a>'
     )
 
     return mensaje
 
 
 # =========================================================
-# ENVIAR NOTICIAS AL USUARIO
+# ENVIAR NOTICIAS
 # =========================================================
 
 async def enviar_noticias(update, titulo, consulta):
@@ -542,9 +608,11 @@ async def enviar_noticias(update, titulo, consulta):
 
     try:
 
-        noticias = consultar_rss(
+        # Ejecutar consulta RSS fuera del ciclo de eventos.
+        noticias = await asyncio.to_thread(
+            consultar_rss,
             consulta,
-            limite=5
+            5
         )
 
         if not noticias:
@@ -561,17 +629,23 @@ async def enviar_noticias(update, titulo, consulta):
             "Preparando fotografías y resúmenes..."
         )
 
-        for numero, noticia in enumerate(noticias, start=1):
+        for numero, noticia in enumerate(
+            noticias,
+            start=1
+        ):
 
             try:
 
                 logger.info(
-                    "Procesando noticia %s de %s",
+                    "Procesando noticia %s de %s: %s",
                     numero,
-                    len(noticias)
+                    len(noticias),
+                    noticia["titulo"]
                 )
 
-                resumen = generar_resumen(
+                # Gemini se ejecuta en un hilo independiente.
+                resumen = await asyncio.to_thread(
+                    generar_resumen,
                     noticia["titulo"],
                     noticia["descripcion"],
                     noticia["fuente"]
@@ -582,8 +656,9 @@ async def enviar_noticias(update, titulo, consulta):
                     resumen
                 )
 
-                # Buscar fotografía de la noticia.
-                imagen = buscar_fotografia(
+                # Buscar fotografía sin bloquear el bot.
+                imagen = await asyncio.to_thread(
+                    buscar_fotografia,
                     noticia,
                     noticia["enlace"]
                 )
@@ -604,7 +679,7 @@ async def enviar_noticias(update, titulo, consulta):
                     except Exception as e:
 
                         logger.warning(
-                            "No se pudo enviar la fotografía: %s",
+                            "No se pudo enviar fotografía: %s",
                             e
                         )
 
@@ -622,10 +697,16 @@ async def enviar_noticias(update, titulo, consulta):
                         disable_web_page_preview=False
                     )
 
+                logger.info(
+                    "Noticia %s enviada correctamente.",
+                    numero
+                )
+
             except Exception as e:
 
                 logger.exception(
-                    "Error procesando una noticia: %s",
+                    "Error procesando noticia %s: %s",
+                    numero,
                     e
                 )
 
@@ -750,7 +831,7 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================================
-# MANEJO DE ERRORES DE TELEGRAM
+# MANEJO DE ERRORES
 # =========================================================
 
 async def error_handler(update, context):
@@ -762,7 +843,7 @@ async def error_handler(update, context):
 
 
 # =========================================================
-# CONFIGURAR BOT Y WEBHOOK
+# INICIALIZAR BOT
 # =========================================================
 
 async def inicializar_bot():
@@ -777,7 +858,23 @@ async def inicializar_bot():
         allowed_updates=["message"]
     )
 
-    logger.info("Webhook configurado correctamente.")
+    logger.info(
+        "Webhook configurado correctamente."
+    )
+
+
+# =========================================================
+# COMPARAR SECRETO DEL WEBHOOK
+# =========================================================
+
+def hmac_comparar(valor1, valor2):
+
+    import hmac
+
+    return hmac.compare_digest(
+        str(valor1),
+        str(valor2)
+    )
 
 
 # =========================================================
@@ -796,7 +893,7 @@ def webhook():
     ):
 
         logger.warning(
-            "Se recibió una solicitud con secreto incorrecto."
+            "Solicitud con secreto incorrecto."
         )
 
         return "Unauthorized", 403
@@ -808,44 +905,78 @@ def webhook():
         if not datos:
             return "No content", 400
 
+        update_id = datos.get("update_id")
+
+        # Evitar procesar dos veces la misma actualización.
+        if update_id is not None:
+
+            with update_lock:
+
+                if update_id in processed_update_ids:
+
+                    logger.info(
+                        "Actualización duplicada ignorada: %s",
+                        update_id
+                    )
+
+                    return "OK", 200
+
+                processed_update_ids.add(update_id)
+
+                # Mantener el registro limitado.
+                if len(processed_update_ids) > 2000:
+
+                    processed_update_ids.clear()
+                    processed_update_ids.add(update_id)
+
         update = Update.de_json(
             datos,
             application.bot
         )
 
-        future = asyncio.run_coroutine_threadsafe(
+        # Enviar el trabajo al ciclo de eventos y responder
+        # inmediatamente a Telegram.
+        asyncio.run_coroutine_threadsafe(
             application.process_update(update),
             event_loop
         )
-
-        # Esperar a que Telegram reciba confirmación
-        # de que la actualización fue procesada.
-        future.result(timeout=15)
 
         return "OK", 200
 
     except Exception as e:
 
         logger.exception(
-            "Error procesando webhook: %s",
+            "Error recibiendo actualización: %s",
             e
         )
 
         return "Internal Server Error", 500
 
 
-def hmac_comparar(valor1, valor2):
+# =========================================================
+# PÁGINA DE ESTADO
+# =========================================================
 
-    import hmac
+@app.route("/", methods=["GET"])
+def inicio():
 
-    return hmac.compare_digest(
-        str(valor1),
-        str(valor2)
+    return (
+        "Noticiero Mundial Express está funcionando correctamente.",
+        200
     )
 
 
+@app.route("/health", methods=["GET"])
+def health():
+
+    return {
+        "status": "online",
+        "bot": "Noticiero Mundial Express"
+    }, 200
+
+
 # =========================================================
-# INICIAR SERVIDOR
+# EJECUTAR CICLO DE EVENTOS
 # =========================================================
 
 def ejecutar_event_loop(loop):
@@ -853,6 +984,10 @@ def ejecutar_event_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
+
+# =========================================================
+# INICIAR SERVIDOR
+# =========================================================
 
 def main():
 
@@ -890,9 +1025,11 @@ def main():
         CommandHandler("ayuda", ayuda)
     )
 
-    application.add_error_handler(error_handler)
+    application.add_error_handler(
+        error_handler
+    )
 
-    # Crear y arrancar el ciclo de eventos.
+    # Crear ciclo de eventos.
     event_loop = asyncio.new_event_loop()
 
     hilo = threading.Thread(
@@ -903,7 +1040,7 @@ def main():
 
     hilo.start()
 
-    # Inicializar Telegram y configurar webhook.
+    # Inicializar Telegram.
     futuro = asyncio.run_coroutine_threadsafe(
         inicializar_bot(),
         event_loop
