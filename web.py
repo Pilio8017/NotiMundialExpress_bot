@@ -68,15 +68,15 @@ application = None
 event_loop = None
 
 USER_AGENT = (
-    "Mozilla/5.0 (compatible; "
-    "NoticieroMundialExpress/1.0)"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0 Safari/537.36"
 )
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_TELEGRAM_PHOTO_BYTES = 9 * 1024 * 1024
 MAX_CAPTION_LENGTH = 1024
 
-# Evitar actualizaciones duplicadas.
 processed_update_ids = set()
 update_lock = threading.Lock()
 
@@ -130,12 +130,13 @@ class ImageParser(HTMLParser):
                 if imagen:
                     self.imagenes.append(imagen)
 
-        if tag.lower() == "img":
+        elif tag.lower() == "img":
 
             imagen = (
-                atributos.get("src")
-                or atributos.get("data-src")
+                atributos.get("data-src")
                 or atributos.get("data-original")
+                or atributos.get("data-lazy-src")
+                or atributos.get("src")
             )
 
             if imagen:
@@ -184,6 +185,103 @@ def descargar_url(url, timeout=12):
         )
 
         return None
+
+
+# =========================================================
+# ABRIR PÁGINA ORIGINAL Y RESOLVER REDIRECCIONES
+# =========================================================
+
+def descargar_pagina_original(url, timeout=15):
+
+    try:
+
+        solicitud = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml",
+            },
+        )
+
+        with urllib.request.urlopen(
+            solicitud,
+            timeout=timeout
+        ) as respuesta:
+
+            contenido = respuesta.read(4 * 1024 * 1024)
+            url_final = respuesta.geturl()
+
+            return contenido, url_final
+
+    except Exception as e:
+
+        logger.warning(
+            "No se pudo abrir la página original: %s",
+            e
+        )
+
+        return None, url
+
+
+# =========================================================
+# DESCARTAR LOGOTIPOS E IMÁGENES GENÉRICAS
+# =========================================================
+
+def imagen_es_generica(url):
+
+    try:
+
+        partes = urllib.parse.urlparse(url)
+
+        dominio = partes.netloc.lower()
+        ruta = partes.path.lower()
+        texto_completo = (ruta + " " + partes.query).lower()
+
+        dominios_bloqueados = [
+            "news.google.com",
+            "gstatic.com",
+            "google.com",
+            "googleapis.com",
+        ]
+
+        for dominio_bloqueado in dominios_bloqueados:
+
+            if (
+                dominio == dominio_bloqueado
+                or dominio.endswith("." + dominio_bloqueado)
+            ):
+                return True
+
+        palabras_bloqueadas = [
+            "logo",
+            "icon",
+            "favicon",
+            "avatar",
+            "placeholder",
+            "default",
+            "no-image",
+            "noimage",
+            "social-icon",
+            "profile",
+            "sprite",
+            "brand",
+        ]
+
+        if any(
+            palabra in texto_completo
+            for palabra in palabras_bloqueadas
+        ):
+            return True
+
+        extension = ruta.rsplit(".", 1)[-1]
+
+        if extension in ["svg", "ico"]:
+            return True
+
+        return False
+
+    except Exception:
+        return True
 
 
 # =========================================================
@@ -332,9 +430,11 @@ def descargar_imagen(url):
             )
 
             if not datos or len(datos) > MAX_IMAGE_BYTES:
+
                 logger.warning(
-                    "Imagen descartada por superar el límite de descarga."
+                    "Imagen descartada por superar el límite."
                 )
+
                 return None
 
             return datos
@@ -345,6 +445,43 @@ def descargar_imagen(url):
             "No se pudo descargar imagen: %s",
             e
         )
+
+        return None
+
+
+# =========================================================
+# VALIDAR QUE SEA UNA FOTOGRAFÍA REAL
+# =========================================================
+
+def descargar_fotografia_valida(url):
+
+    if imagen_es_generica(url):
+        return None
+
+    datos = descargar_imagen(url)
+
+    if not datos:
+        return None
+
+    try:
+
+        imagen = Image.open(BytesIO(datos))
+
+        ancho, alto = imagen.size
+
+        if ancho < 320 or alto < 180:
+            return None
+
+        proporcion = ancho / alto
+
+        if proporcion < 0.45 or proporcion > 2.8:
+            return None
+
+        imagen.verify()
+
+        return datos
+
+    except Exception:
 
         return None
 
@@ -364,36 +501,16 @@ def preparar_imagen_telegram(datos):
             BytesIO(datos)
         )
 
-        # Corregir orientación según los metadatos EXIF.
         imagen = ImageOps.exif_transpose(
             imagen_original
         )
 
-        # Evitar imágenes excesivamente grandes.
         imagen.thumbnail(
             (1600, 1600),
             Image.Resampling.LANCZOS
         )
 
-        # Convertir transparencias a fondo blanco.
-        if imagen.mode in ("RGBA", "LA"):
-
-            imagen = imagen.convert("RGBA")
-
-            fondo = Image.new(
-                "RGB",
-                imagen.size,
-                (255, 255, 255)
-            )
-
-            fondo.paste(
-                imagen,
-                mask=imagen.getchannel("A")
-            )
-
-            imagen = fondo
-
-        elif imagen.mode == "P":
+        if imagen.mode in ("RGBA", "LA") or imagen.mode == "P":
 
             imagen = imagen.convert("RGBA")
 
@@ -414,7 +531,6 @@ def preparar_imagen_telegram(datos):
 
             imagen = imagen.convert("RGB")
 
-        # Generar JPG optimizado.
         salida = BytesIO()
 
         calidad = 88
@@ -485,16 +601,13 @@ def preparar_imagen_telegram(datos):
 
 def buscar_imagen_original(noticia):
 
-    candidatos = list(
-        noticia.get("imagenes", [])
-    )
-
     enlace = noticia["enlace"]
 
-    contenido = descargar_url(
-        enlace,
-        timeout=12
+    contenido, url_final = descargar_pagina_original(
+        enlace
     )
+
+    candidatos = []
 
     if contenido:
 
@@ -508,14 +621,20 @@ def buscar_imagen_original(noticia):
             parser = ImageParser()
             parser.feed(texto_html)
 
+            # Primero las imágenes de la página original.
             candidatos.extend(parser.imagenes)
 
         except Exception as e:
 
             logger.warning(
-                "Error leyendo imágenes de la noticia: %s",
+                "Error leyendo imágenes de la publicación: %s",
                 e
             )
+
+    # Las imágenes del RSS quedan como segunda opción.
+    candidatos.extend(
+        noticia.get("imagenes", [])
+    )
 
     revisadas = set()
 
@@ -529,7 +648,7 @@ def buscar_imagen_original(noticia):
         )
 
         imagen = urllib.parse.urljoin(
-            enlace,
+            url_final,
             imagen
         )
 
@@ -541,15 +660,30 @@ def buscar_imagen_original(noticia):
         if not imagen.startswith(("http://", "https://")):
             continue
 
-        datos = descargar_imagen(imagen)
+        if imagen_es_generica(imagen):
+
+            logger.info(
+                "Imagen genérica descartada: %s",
+                imagen[:150]
+            )
+
+            continue
+
+        datos = descargar_fotografia_valida(
+            imagen
+        )
 
         if datos:
 
             logger.info(
-                "Fotografía original encontrada."
+                "Fotografía válida encontrada en la publicación original."
             )
 
             return datos
+
+    logger.info(
+        "No se encontró fotografía válida en la publicación original."
+    )
 
     return None
 
@@ -626,6 +760,26 @@ def buscar_imagen_commons(titulo):
 
         for pagina in paginas.values():
 
+            titulo_archivo = pagina.get(
+                "title",
+                ""
+            ).lower()
+
+            if any(
+                palabra in titulo_archivo
+                for palabra in [
+                    "logo",
+                    "icon",
+                    "favicon",
+                    "flag",
+                    "symbol",
+                    "default",
+                    "avatar",
+                    "placeholder",
+                ]
+            ):
+                continue
+
             informacion = pagina.get(
                 "imageinfo",
                 []
@@ -664,15 +818,10 @@ def buscar_imagen_commons(titulo):
                 ).get("value", "Autor no identificado")
             )
 
-            titulo_archivo = pagina.get(
-                "title",
-                ""
-            )
-
             pagina_archivo = (
                 "https://commons.wikimedia.org/wiki/"
                 + urllib.parse.quote(
-                    titulo_archivo.replace(" ", "_"),
+                    pagina.get("title", "").replace(" ", "_"),
                     safe=":"
                 )
             )
@@ -685,7 +834,9 @@ def buscar_imagen_commons(titulo):
             if not url_imagen:
                 continue
 
-            datos = descargar_imagen(url_imagen)
+            datos = descargar_fotografia_valida(
+                url_imagen
+            )
 
             if not datos:
                 continue
@@ -720,6 +871,7 @@ def buscar_imagen_commons(titulo):
 
 def buscar_fotografia(noticia):
 
+    # Primera opción: fotografía de la publicación original.
     imagen_original = buscar_imagen_original(
         noticia
     )
@@ -733,6 +885,7 @@ def buscar_fotografia(noticia):
             ),
         }
 
+    # Segunda opción: Wikimedia Commons.
     logger.info(
         "No hay fotografía original. Buscando alternativa..."
     )
@@ -935,7 +1088,6 @@ def crear_mensaje(noticia, resumen, credito=None):
 
 async def enviar_fotografia_y_texto(chat, fotografia, mensaje):
 
-    # Primero convertir la imagen a JPG compatible.
     imagen_jpg = await asyncio.to_thread(
         preparar_imagen_telegram,
         fotografia["datos"]
@@ -955,7 +1107,6 @@ async def enviar_fotografia_y_texto(chat, fotografia, mensaje):
 
         return False
 
-    # Si el texto completo cabe en el caption, enviarlo junto con la foto.
     if len(mensaje) <= MAX_CAPTION_LENGTH:
 
         try:
@@ -982,11 +1133,10 @@ async def enviar_fotografia_y_texto(chat, fotografia, mensaje):
         except Exception as e:
 
             logger.exception(
-                "FALLO REAL AL ENVIAR FOTOGRAFÍA CON CAPTION: %s",
+                "FALLO AL ENVIAR FOTOGRAFÍA CON CAPTION: %s",
                 e
             )
 
-            # Intentar nuevamente sin caption.
             try:
 
                 await chat.send_photo(
@@ -998,10 +1148,6 @@ async def enviar_fotografia_y_texto(chat, fotografia, mensaje):
                     write_timeout=40,
                     connect_timeout=20,
                     pool_timeout=20
-                )
-
-                logger.info(
-                    "Fotografía enviada sin caption. Enviando texto separado."
                 )
 
                 await chat.send_message(
@@ -1027,7 +1173,6 @@ async def enviar_fotografia_y_texto(chat, fotografia, mensaje):
 
                 return False
 
-    # Si el mensaje supera 1024 caracteres, enviar foto y texto separados.
     try:
 
         await chat.send_photo(
@@ -1041,10 +1186,6 @@ async def enviar_fotografia_y_texto(chat, fotografia, mensaje):
             write_timeout=40,
             connect_timeout=20,
             pool_timeout=20
-        )
-
-        logger.info(
-            "Fotografía enviada. El texto se enviará por separado."
         )
 
         await chat.send_message(
