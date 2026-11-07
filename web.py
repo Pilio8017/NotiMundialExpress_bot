@@ -1,63 +1,75 @@
 
+import asyncio
+import html
+import json
+import logging
 import os
 import re
-import json
-import html
-import logging
-import asyncio
 import threading
-import urllib.request
+import urllib.error
 import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 
-from io import BytesIO
 from html.parser import HTMLParser
-from urllib.parse import urljoin
+from io import BytesIO
 
 from flask import Flask, request
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InputFile
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
 
-
-# ==================================================
+# =========================================================
 # CONFIGURACIÓN
-# ==================================================
+# =========================================================
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-GEMINI_MODEL = os.environ.get(
-    "GEMINI_MODEL",
-    "gemini-3.8-flash"
-)
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
 URL = "https://notimundialexpress-bot.onrender.com"
 WEBHOOK_URL = f"{URL}/webhook"
-
 PORT = int(os.environ.get("PORT", 10000))
 
-MAX_IMAGE_SIZE = 8 * 1024 * 1024
+if not TOKEN:
+    raise RuntimeError("Falta configurar TELEGRAM_TOKEN.")
+
+if not WEBHOOK_SECRET:
+    raise RuntimeError("Falta configurar WEBHOOK_SECRET.")
+
+# =========================================================
+# LOGS
+# =========================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
+
+# Evita que los logs HTTP muestren URLs que puedan contener
+# información sensible, como el token de Telegram.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-
 application = None
-loop = None
+event_loop = None
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+)
 
-# ==================================================
-# LIMPIEZA DE TEXTO
-# ==================================================
+# =========================================================
+# LIMPIEZA DE TEXTO HTML
+# =========================================================
 
 def limpiar_html(texto):
-
     if not texto:
         return ""
 
@@ -68,700 +80,792 @@ def limpiar_html(texto):
     return texto.strip()
 
 
-# ==================================================
-# DETECTAR IMÁGENES EN RSS Y PÁGINAS WEB
-# ==================================================
+# =========================================================
+# BUSCADOR DE IMÁGENES EN HTML
+# =========================================================
 
 class ImageParser(HTMLParser):
 
     def __init__(self):
         super().__init__()
-        self.images = []
+        self.imagenes = []
 
     def handle_starttag(self, tag, attrs):
 
-        data = dict(attrs)
+        atributos = dict(attrs)
 
         if tag.lower() == "meta":
 
-            nombre = (
-                data.get("property", "") or
-                data.get("name", "")
+            propiedad = (
+                atributos.get("property", "")
+                or atributos.get("name", "")
             ).lower()
 
-            if nombre in (
+            if propiedad in [
                 "og:image",
                 "og:image:url",
                 "twitter:image",
-                "twitter:image:src"
-            ):
-
-                imagen = data.get("content")
+                "twitter:image:src",
+            ]:
+                imagen = atributos.get("content")
 
                 if imagen:
-                    self.images.append(imagen)
+                    self.imagenes.append(imagen)
 
         if tag.lower() == "img":
 
             imagen = (
-                data.get("src") or
-                data.get("data-src") or
-                data.get("data-original")
+                atributos.get("src")
+                or atributos.get("data-src")
+                or atributos.get("data-original")
             )
 
             if imagen:
-                self.images.append(imagen)
+                self.imagenes.append(imagen)
 
-            srcset = data.get("srcset", "")
+            srcset = atributos.get("srcset")
 
             if srcset:
-                primera = srcset.split(",")[0].strip().split(" ")[0]
+                partes = srcset.split(",")
 
-                if primera:
-                    self.images.append(primera)
+                for parte in partes:
+                    url = parte.strip().split(" ")[0]
+
+                    if url:
+                        self.imagenes.append(url)
 
 
-def obtener_imagenes_rss(item):
+# =========================================================
+# DESCARGAR CONTENIDO WEB
+# =========================================================
 
-    imagenes = []
+def descargar_url(url, timeout=12):
+
+    try:
+
+        solicitud = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "*/*",
+            },
+        )
+
+        with urllib.request.urlopen(
+            solicitud,
+            timeout=timeout
+        ) as respuesta:
+
+            return respuesta.read()
+
+    except Exception as e:
+
+        logger.warning("No se pudo descargar contenido: %s", e)
+        return None
+
+
+# =========================================================
+# OBTENER FOTOGRAFÍA DE UNA NOTICIA
+# =========================================================
+
+def buscar_fotografia(item, enlace):
+
+    candidatos = []
+
+    # 1. Revisar imágenes incluidas directamente en el RSS.
 
     for elemento in item.iter():
 
-        tag = elemento.tag.lower()
+        etiqueta = elemento.tag.lower()
 
-        if tag.endswith(("thumbnail", "content")):
-            url_imagen = elemento.attrib.get("url")
+        if etiqueta.endswith("}content") or etiqueta.endswith("}thumbnail"):
 
-            if url_imagen:
-                imagenes.append(url_imagen)
+            imagen = elemento.attrib.get("url")
 
-        if tag.endswith("enclosure"):
+            if imagen:
+                candidatos.append(imagen)
 
-            url_imagen = elemento.attrib.get("url")
+        if etiqueta.endswith("enclosure"):
+
+            imagen = elemento.attrib.get("url")
             tipo = elemento.attrib.get("type", "")
 
-            if url_imagen and tipo.startswith("image/"):
-                imagenes.append(url_imagen)
+            if imagen and "image" in tipo.lower():
+                candidatos.append(imagen)
 
-    # Buscar imágenes dentro de la descripción
-    for nombre in ("description", "{http://purl.org/rss/1.0/modules/content/}encoded"):
+    # 2. Revisar imágenes dentro de la descripción RSS.
 
-        elemento = item.find(nombre)
+    descripcion = ""
 
-        if elemento is not None and elemento.text:
+    elemento_descripcion = item.find("description")
 
-            parser = ImageParser()
+    if elemento_descripcion is not None:
+        descripcion = elemento_descripcion.text or ""
 
-            try:
-                parser.feed(elemento.text)
-                imagenes.extend(parser.images)
-            except Exception:
-                pass
-
-    return imagenes
-
-
-def obtener_imagenes_pagina(url):
+    parser_rss = ImageParser()
 
     try:
+        parser_rss.feed(descripcion)
+        candidatos.extend(parser_rss.imagenes)
+    except Exception:
+        pass
 
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"
-            }
-        )
+    # 3. Revisar metadatos de la página original.
 
-        with urllib.request.urlopen(req, timeout=10) as response:
+    contenido = descargar_url(enlace)
 
-            contenido = response.read(700000).decode(
+    if contenido:
+
+        try:
+
+            texto_html = contenido.decode(
                 "utf-8",
-                errors="ignore"
+                errors="replace"
             )
 
-            pagina_final = response.geturl()
+            parser_web = ImageParser()
+            parser_web.feed(texto_html)
 
-        parser = ImageParser()
-        parser.feed(contenido)
+            candidatos.extend(parser_web.imagenes)
 
-        imagenes = [
-            urljoin(pagina_final, imagen)
-            for imagen in parser.images
-        ]
+        except Exception as e:
 
-        return imagenes
+            logger.warning(
+                "No se pudieron analizar imágenes de la página: %s",
+                e
+            )
 
-    except Exception as e:
+    # 4. Intentar descargar las imágenes encontradas.
 
-        logger.warning(
-            "No se pudo revisar la página del artículo: %s",
-            e
-        )
+    imagenes_revisadas = set()
 
-        return []
-
-
-# ==================================================
-# DESCARGAR Y VALIDAR FOTOGRAFÍAS
-# ==================================================
-
-def descargar_imagen(url):
-
-    if not url or not url.startswith(("http://", "https://")):
-        return None
-
-    try:
-
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "image/*"
-            }
-        )
-
-        with urllib.request.urlopen(req, timeout=12) as response:
-
-            tipo = response.headers.get("Content-Type", "").lower()
-
-            if not tipo.startswith("image/"):
-                return None
-
-            contenido = response.read(MAX_IMAGE_SIZE + 1)
-
-            if len(contenido) > MAX_IMAGE_SIZE:
-                return None
-
-            if not contenido:
-                return None
-
-        archivo = BytesIO(contenido)
-        archivo.name = "noticia.jpg"
-
-        return archivo
-
-    except Exception as e:
-
-        logger.warning(
-            "No se pudo descargar imagen: %s",
-            e
-        )
-
-        return None
-
-
-def buscar_fotografia(noticia):
-
-    candidatos = noticia.get("imagenes", [])
-
-    # Primero probar las imágenes proporcionadas por el RSS
     for imagen in candidatos:
 
-        archivo = descargar_imagen(imagen)
+        if not imagen:
+            continue
 
-        if archivo:
-            return archivo
+        imagen = html.unescape(imagen.strip())
 
-    # Si no hay imágenes válidas, revisar la página original
-    enlace = noticia.get("enlace")
+        imagen = urllib.parse.urljoin(enlace, imagen)
 
-    if enlace:
+        if imagen in imagenes_revisadas:
+            continue
 
-        imagenes_pagina = obtener_imagenes_pagina(enlace)
+        imagenes_revisadas.add(imagen)
 
-        for imagen in imagenes_pagina:
+        if not imagen.startswith(("http://", "https://")):
+            continue
 
-            archivo = descargar_imagen(imagen)
+        try:
 
-            if archivo:
-                return archivo
+            solicitud = urllib.request.Request(
+                imagen,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "image/*",
+                },
+            )
+
+            with urllib.request.urlopen(
+                solicitud,
+                timeout=10
+            ) as respuesta:
+
+                tipo = respuesta.headers.get(
+                    "Content-Type",
+                    ""
+                )
+
+                if "image" not in tipo.lower():
+                    continue
+
+                datos = respuesta.read(5 * 1024 * 1024 + 1)
+
+                if len(datos) > 5 * 1024 * 1024:
+                    continue
+
+                if not datos:
+                    continue
+
+                return datos
+
+        except Exception as e:
+
+            logger.warning(
+                "No se pudo obtener una imagen: %s",
+                e
+            )
 
     return None
 
 
-# ==================================================
-# CONSULTAR GOOGLE NEWS RSS
-# ==================================================
+# =========================================================
+# CONSULTAR NOTICIAS DE GOOGLE NEWS
+# =========================================================
 
-def consultar_rss(tema, cantidad=5):
-
-    query = urllib.parse.quote(tema)
-
-    rss_url = (
-        "https://news.google.com/rss/search?"
-        f"q={query}&hl=es-419&gl=CR&ceid=CR:es-419"
-    )
+def consultar_rss(consulta, limite=5):
 
     noticias = []
 
+    consulta_codificada = urllib.parse.quote(consulta)
+
+    url = (
+        "https://news.google.com/rss/search?q="
+        f"{consulta_codificada}"
+        "&hl=es-419&gl=CR&ceid=CR:es-419"
+    )
+
+    contenido = descargar_url(url, timeout=15)
+
+    if not contenido:
+        return noticias
+
     try:
 
-        req = urllib.request.Request(
-            rss_url,
-            headers={
-                "User-Agent": "Mozilla/5.0"
-            }
-        )
+        raiz = ET.fromstring(contenido)
 
-        with urllib.request.urlopen(req, timeout=20) as response:
-            contenido = response.read()
+        canal = raiz.find("channel")
 
-        root = ET.fromstring(contenido)
+        if canal is None:
+            return noticias
 
-        for item in root.findall(".//item")[:cantidad]:
+        for item in canal.findall("item")[:limite]:
 
-            titulo = limpiar_html(
-                item.findtext("title", default="Sin título")
-            )
+            titulo = item.findtext("title", "")
+            enlace = item.findtext("link", "")
+            descripcion = item.findtext("description", "")
+            fecha = item.findtext("pubDate", "")
 
-            enlace = item.findtext("link", default="")
+            fuente = "Google News"
 
-            descripcion = limpiar_html(
-                item.findtext("description", default="")
-            )
+            elemento_fuente = item.find("source")
 
-            fuente_elemento = item.find("source")
+            if elemento_fuente is not None:
+                fuente = elemento_fuente.text or "Google News"
 
-            fuente = (
-                fuente_elemento.text
-                if fuente_elemento is not None and fuente_elemento.text
-                else "Fuente informativa"
-            )
+            titulo = limpiar_html(titulo)
+            descripcion = limpiar_html(descripcion)
 
-            imagenes = obtener_imagenes_rss(item)
+            if not titulo or not enlace:
+                continue
 
             noticias.append({
                 "titulo": titulo,
                 "enlace": enlace,
                 "descripcion": descripcion,
                 "fuente": fuente,
-                "imagenes": imagenes
+                "fecha": fecha,
+                "imagen": None,
             })
 
     except Exception as e:
 
         logger.exception(
-            "Error consultando Google News: %s",
+            "Error procesando Google News RSS: %s",
             e
         )
 
     return noticias
 
 
-# ==================================================
-# RESUMEN CON GEMINI
-# ==================================================
+# =========================================================
+# GENERAR RESUMEN CON GEMINI
+# =========================================================
 
-def generar_resumen(noticia):
-
-    titulo = noticia["titulo"]
-    descripcion = noticia["descripcion"]
+def generar_resumen(titulo, descripcion, fuente):
 
     if not GEMINI_API_KEY:
 
-        return (
-            descripcion[:400]
-            if descripcion
-            else "Consulta el enlace para conocer los detalles."
+        logger.warning(
+            "No está configurada GEMINI_API_KEY."
         )
 
-    contenido = (
+        return descripcion[:450] if descripcion else (
+            "No hay información suficiente para generar el resumen."
+        )
+
+    contexto = (
         f"Titular: {titulo}\n"
-        f"Descripción disponible: {descripcion}"
+        f"Descripción disponible: {descripcion}\n"
+        f"Fuente: {fuente}"
     )
 
-    instruccion = """
-    Eres el redactor de Noticiero Mundial Express.
-
-    Resume la noticia en español.
-
-    Reglas:
-    - Escribe entre 35 y 55 palabras.
-    - Utiliza lenguaje sencillo y profesional.
-    - Explica qué ocurrió y por qué es importante.
-    - No inventes información.
-    - No agregues opiniones.
-    - Si la información es insuficiente, indícalo.
-    - Entrega solamente el resumen.
-    """
-
-    api_url = (
-        "https://generativelanguage.googleapis.com/v1beta/"
-        f"models/{GEMINI_MODEL}:generateContent"
+    instruccion = (
+        "Eres un periodista que resume noticias en español. "
+        "Resume la noticia en un lenguaje sencillo, claro y neutral. "
+        "Escribe entre 2 y 4 oraciones cortas. "
+        "No inventes datos, fechas, cifras ni declaraciones. "
+        "Si la información es insuficiente, indícalo claramente. "
+        "No agregues opiniones personales.\n\n"
+        f"{contexto}"
     )
 
-    payload = {
-        "systemInstruction": {
-            "parts": [
-                {"text": instruccion}
-            ]
-        },
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{GEMINI_MODEL}:generateContent"
+    )
+
+    datos = {
         "contents": [
             {
                 "parts": [
-                    {"text": contenido}
+                    {
+                        "text": instruccion
+                    }
                 ]
             }
         ],
         "generationConfig": {
             "temperature": 0.3,
-            "maxOutputTokens": 150
+            "maxOutputTokens": 180
         }
     }
 
+    cuerpo = json.dumps(datos).encode("utf-8")
+
+    solicitud = urllib.request.Request(
+        url,
+        data=cuerpo,
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY,
+        },
+        method="POST",
+    )
+
     try:
 
-        datos = json.dumps(payload).encode("utf-8")
-
-        req = urllib.request.Request(
-            api_url,
-            data=datos,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": GEMINI_API_KEY
-            },
-            method="POST"
-        )
-
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with urllib.request.urlopen(
+            solicitud,
+            timeout=25
+        ) as respuesta:
 
             resultado = json.loads(
-                response.read().decode("utf-8")
+                respuesta.read().decode("utf-8")
             )
 
-        resumen = (
-            resultado["candidates"][0]
-            ["content"]["parts"][0]["text"]
+        candidatos = resultado.get("candidates", [])
+
+        if not candidatos:
+            logger.warning(
+                "Gemini respondió sin candidatos."
+            )
+
+            return descripcion[:450] if descripcion else (
+                "No fue posible generar el resumen."
+            )
+
+        partes = (
+            candidatos[0]
+            .get("content", {})
+            .get("parts", [])
         )
 
-        return resumen.strip()
+        resumen = " ".join(
+            parte.get("text", "")
+            for parte in partes
+        ).strip()
+
+        if resumen:
+            return resumen
+
+        return descripcion[:450] if descripcion else (
+            "No fue posible generar el resumen."
+        )
+
+    except urllib.error.HTTPError as e:
+
+        try:
+            detalle = e.read().decode(
+                "utf-8",
+                errors="replace"
+            )
+        except Exception:
+            detalle = str(e)
+
+        # No registrar la clave API ni la URL completa.
+        logger.error(
+            "ERROR DETALLADO DE GEMINI - HTTP %s: %s",
+            e.code,
+            detalle
+        )
+
+        return descripcion[:450] if descripcion else (
+            "No fue posible generar el resumen en este momento."
+        )
 
     except Exception as e:
 
-        logger.warning(
-            "Gemini no pudo generar el resumen: %s",
+        logger.exception(
+            "ERROR AL GENERAR RESUMEN CON GEMINI: %s",
             e
         )
 
-        return (
-            descripcion[:400]
-            if descripcion
-            else "No fue posible generar el resumen. "
-                 "Consulta la noticia original."
+        return descripcion[:450] if descripcion else (
+            "No fue posible generar el resumen en este momento."
         )
 
 
-# ==================================================
-# FORMATO PROFESIONAL DE NOTICIAS
-# ==================================================
+# =========================================================
+# CREAR MENSAJE DE NOTICIA
+# =========================================================
 
 def crear_mensaje(noticia, resumen):
 
-    titulo = html.escape(noticia["titulo"])
-    fuente = html.escape(noticia["fuente"])
-    resumen = html.escape(resumen)
+    titulo = noticia["titulo"]
+    fuente = noticia["fuente"]
+    enlace = noticia["enlace"]
 
-    enlace = html.escape(
-        noticia["enlace"],
-        quote=True
+    mensaje = (
+        f"🌎 <b>{html.escape(titulo)}</b>\n\n"
+        f"📝 <b>Resumen:</b>\n"
+        f"{html.escape(resumen)}\n\n"
+        f"📰 <b>Fuente:</b> {html.escape(fuente)}\n\n"
+        f'🔗 <a href="{html.escape(enlace, quote=True)}">'
+        "Leer noticia completa</a>"
     )
 
-    texto = (
-        f"🌎 <b>NOTICIERO MUNDIAL EXPRESS</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n\n"
-        f"📰 <b>{titulo}</b>\n\n"
-        f"📝 <b>RESUMEN</b>\n"
-        f"{resumen}\n\n"
-        f"📡 <b>Fuente:</b> {fuente}\n\n"
-        f"🔗 <a href=\"{enlace}\">LEER NOTICIA ORIGINAL</a>\n\n"
-        f"━━━━━━━━━━━━━━━━━━"
+    return mensaje
+
+
+# =========================================================
+# ENVIAR NOTICIAS AL USUARIO
+# =========================================================
+
+async def enviar_noticias(update, titulo, consulta):
+
+    chat = update.effective_chat
+
+    mensaje_estado = await chat.send_message(
+        f"🔎 Buscando {titulo.lower()}..."
     )
 
-    return texto
+    try:
 
-
-# ==================================================
-# PUBLICAR NOTICIAS EN TELEGRAM
-# ==================================================
-
-async def enviar_noticias(update, tema, seccion):
-
-    mensaje = await update.message.reply_text(
-        f"🌎 Buscando noticias de {seccion}..."
-    )
-
-    noticias = await asyncio.to_thread(
-        consultar_rss,
-        tema,
-        5
-    )
-
-    if not noticias:
-
-        await mensaje.edit_text(
-            "No encontré noticias en este momento. "
-            "Inténtalo nuevamente."
+        noticias = consultar_rss(
+            consulta,
+            limite=5
         )
 
-        return
+        if not noticias:
 
-    await mensaje.delete()
+            await mensaje_estado.edit_text(
+                "No encontré noticias disponibles en este momento. "
+                "Inténtalo nuevamente más tarde."
+            )
 
-    for noticia in noticias:
+            return
 
-        # Generar resumen
-        resumen = await asyncio.to_thread(
-            generar_resumen,
-            noticia
+        await mensaje_estado.edit_text(
+            f"📰 Encontré {len(noticias)} noticias. "
+            "Preparando fotografías y resúmenes..."
         )
 
-        texto = crear_mensaje(
-            noticia,
-            resumen
+        for numero, noticia in enumerate(noticias, start=1):
+
+            try:
+
+                logger.info(
+                    "Procesando noticia %s de %s",
+                    numero,
+                    len(noticias)
+                )
+
+                resumen = generar_resumen(
+                    noticia["titulo"],
+                    noticia["descripcion"],
+                    noticia["fuente"]
+                )
+
+                mensaje = crear_mensaje(
+                    noticia,
+                    resumen
+                )
+
+                # Buscar fotografía de la noticia.
+                imagen = buscar_fotografia(
+                    noticia,
+                    noticia["enlace"]
+                )
+
+                if imagen:
+
+                    try:
+
+                        await chat.send_photo(
+                            photo=InputFile(
+                                BytesIO(imagen),
+                                filename="noticia.jpg"
+                            ),
+                            caption=mensaje,
+                            parse_mode="HTML"
+                        )
+
+                    except Exception as e:
+
+                        logger.warning(
+                            "No se pudo enviar la fotografía: %s",
+                            e
+                        )
+
+                        await chat.send_message(
+                            mensaje,
+                            parse_mode="HTML",
+                            disable_web_page_preview=False
+                        )
+
+                else:
+
+                    await chat.send_message(
+                        mensaje,
+                        parse_mode="HTML",
+                        disable_web_page_preview=False
+                    )
+
+            except Exception as e:
+
+                logger.exception(
+                    "Error procesando una noticia: %s",
+                    e
+                )
+
+                await chat.send_message(
+                    "⚠️ No pude procesar una noticia. "
+                    "Continuaré con las demás."
+                )
+
+        try:
+
+            await mensaje_estado.delete()
+
+        except Exception:
+            pass
+
+        await chat.send_message(
+            "✅ <b>Noticias actualizadas.</b>\n"
+            "Gracias por utilizar Noticiero Mundial Express.",
+            parse_mode="HTML"
         )
 
-        # Buscar y descargar fotografía
-        fotografia = await asyncio.to_thread(
-            buscar_fotografia,
-            noticia
+    except Exception as e:
+
+        logger.exception(
+            "Error general enviando noticias: %s",
+            e
         )
 
         try:
 
-            if fotografia:
-
-                fotografia.seek(0)
-
-                await update.message.reply_photo(
-                    photo=fotografia,
-                    caption=texto,
-                    parse_mode="HTML"
-                )
-
-            else:
-
-                # Si no existe fotografía, enviar noticia
-                # con vista previa del enlace cuando Telegram
-                # pueda obtenerla de la publicación original.
-
-                await update.message.reply_text(
-                    texto,
-                    parse_mode="HTML",
-                    disable_web_page_preview=False
-                )
-
-        except Exception as e:
-
-            logger.warning(
-                "Error enviando noticia: %s",
-                e
+            await mensaje_estado.edit_text(
+                "Ocurrió un problema al consultar las noticias. "
+                "Inténtalo nuevamente."
             )
 
-            await update.message.reply_text(
-                texto,
-                parse_mode="HTML",
-                disable_web_page_preview=False
-            )
+        except Exception:
+            pass
 
 
-# ==================================================
+# =========================================================
 # COMANDOS DEL BOT
-# ==================================================
+# =========================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    texto = """
-🌎 <b>¡Bienvenido a Noticiero Mundial Express!</b>
-
-Información mundial en un solo lugar.
-
-📰 /noticias - Noticias internacionales
-🎬 /cine - Cine y entretenimiento
-📈 /mercados - Economía y mercados
-⚽ /deportes - Noticias deportivas
-
-ℹ️ /ayuda - Ver comandos
-
-<i>Información clara, rápida y mundial.</i>
-"""
+    mensaje = (
+        "🌎 <b>¡Bienvenido a Noticiero Mundial Express!</b>\n\n"
+        "Tu espacio para mantenerte informado de manera "
+        "rápida y sencilla.\n\n"
+        "Selecciona una categoría:\n\n"
+        "📰 /noticias - Noticias internacionales\n"
+        "🎬 /cine - Cine y entretenimiento\n"
+        "📈 /mercados - Economía y mercados financieros\n"
+        "⚽ /deportes - Noticias deportivas\n"
+        "ℹ️ /ayuda - Información del bot\n\n"
+        "Cada noticia incluye, cuando está disponible, "
+        "una fotografía, un resumen y el enlace a su fuente."
+    )
 
     await update.message.reply_text(
-        texto,
+        mensaje,
         parse_mode="HTML"
     )
 
 
-async def noticias(update, context):
+async def noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await enviar_noticias(
         update,
-        "noticias internacionales mundo",
-        "Noticias internacionales"
+        "Noticias internacionales",
+        "noticias internacionales mundo"
     )
 
 
-async def cine(update, context):
+async def cine(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await enviar_noticias(
         update,
-        "cine películas series entretenimiento",
-        "Cine y entretenimiento"
+        "Cine y entretenimiento",
+        "cine películas series entretenimiento"
     )
 
 
-async def mercados(update, context):
+async def mercados(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await enviar_noticias(
         update,
-        "economía mercados financieros bolsa",
-        "Economía y mercados"
+        "Economía y mercados financieros",
+        "economía mercados financieros bolsa"
     )
 
 
-async def deportes(update, context):
+async def deportes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await enviar_noticias(
         update,
-        "deportes fútbol deportes internacionales",
-        "Deportes"
+        "Deportes",
+        "deportes fútbol deportes internacionales"
     )
 
 
-async def ayuda(update, context):
+async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    texto = """
-📌 <b>COMANDOS DISPONIBLES</b>
-
-/start - Menú principal
-/noticias - Noticias internacionales
-/cine - Cine y entretenimiento
-/mercados - Economía y mercados
-/deportes - Noticias deportivas
-/ayuda - Ayuda
-
-🌎 <i>Noticiero Mundial Express</i>
-"""
+    mensaje = (
+        "ℹ️ <b>AYUDA - NOTICIERO MUNDIAL EXPRESS</b>\n\n"
+        "Estos son los comandos disponibles:\n\n"
+        "/start - Iniciar el bot\n"
+        "/noticias - Noticias internacionales\n"
+        "/cine - Cine y entretenimiento\n"
+        "/mercados - Economía y mercados\n"
+        "/deportes - Noticias deportivas\n"
+        "/ayuda - Mostrar esta información\n\n"
+        "Las noticias provienen de Google News. "
+        "Los resúmenes se generan con inteligencia artificial "
+        "cuando el servicio está disponible."
+    )
 
     await update.message.reply_text(
-        texto,
+        mensaje,
         parse_mode="HTML"
     )
 
 
-# ==================================================
-# INICIALIZAR TELEGRAM
-# ==================================================
+# =========================================================
+# MANEJO DE ERRORES DE TELEGRAM
+# =========================================================
 
-async def initialize_bot():
+async def error_handler(update, context):
+
+    logger.error(
+        "Error en el bot de Telegram: %s",
+        context.error
+    )
+
+
+# =========================================================
+# CONFIGURAR BOT Y WEBHOOK
+# =========================================================
+
+async def inicializar_bot():
 
     await application.initialize()
+
     await application.start()
 
     await application.bot.set_webhook(
         url=WEBHOOK_URL,
-        secret_token=WEBHOOK_SECRET
+        secret_token=WEBHOOK_SECRET,
+        allowed_updates=["message"]
     )
 
-    logger.info(
-        "Webhook de Telegram configurado correctamente."
-    )
+    logger.info("Webhook configurado correctamente.")
 
 
-# ==================================================
-# WEBHOOK FLASK
-# ==================================================
-
-@app.route("/", methods=["GET"])
-def home():
-
-    return "Noticiero Mundial Express está funcionando."
-
+# =========================================================
+# RECIBIR ACTUALIZACIONES DE TELEGRAM
+# =========================================================
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
 
-    if request.headers.get(
-        "X-Telegram-Bot-Api-Secret-Token"
-    ) != WEBHOOK_SECRET:
+    if not hmac_comparar(
+        request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token",
+            ""
+        ),
+        WEBHOOK_SECRET
+    ):
+
+        logger.warning(
+            "Se recibió una solicitud con secreto incorrecto."
+        )
 
         return "Unauthorized", 403
 
     try:
 
-        datos = request.get_json(force=True)
+        datos = request.get_json(silent=True)
+
+        if not datos:
+            return "No content", 400
 
         update = Update.de_json(
             datos,
             application.bot
         )
 
-        asyncio.run_coroutine_threadsafe(
+        future = asyncio.run_coroutine_threadsafe(
             application.process_update(update),
-            loop
+            event_loop
         )
+
+        # Esperar a que Telegram reciba confirmación
+        # de que la actualización fue procesada.
+        future.result(timeout=15)
 
         return "OK", 200
 
     except Exception as e:
 
         logger.exception(
-            "Error en webhook: %s",
+            "Error procesando webhook: %s",
             e
         )
 
-        return "Error", 500
+        return "Internal Server Error", 500
 
 
-# ==================================================
-# LOOP ASÍNCRONO
-# ==================================================
+def hmac_comparar(valor1, valor2):
 
-def iniciar_loop():
+    import hmac
 
-    global loop
+    return hmac.compare_digest(
+        str(valor1),
+        str(valor2)
+    )
 
-    loop = asyncio.new_event_loop()
+
+# =========================================================
+# INICIAR SERVIDOR
+# =========================================================
+
+def ejecutar_event_loop(loop):
 
     asyncio.set_event_loop(loop)
-
     loop.run_forever()
 
-
-# ==================================================
-# EJECUCIÓN PRINCIPAL
-# ==================================================
 
 def main():
 
     global application
-
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("Falta TELEGRAM_TOKEN")
-
-    if not WEBHOOK_SECRET:
-        raise RuntimeError("Falta WEBHOOK_SECRET")
-
-    if not re.fullmatch(
-        r"[A-Za-z0-9_-]{1,256}",
-        WEBHOOK_SECRET
-    ):
-        raise RuntimeError(
-            "WEBHOOK_SECRET tiene caracteres no permitidos."
-        )
-
-    if not GEMINI_API_KEY:
-
-        logger.warning(
-            "GEMINI_API_KEY no configurada. "
-            "Se utilizarán descripciones del RSS."
-        )
+    global event_loop
 
     application = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
+        ApplicationBuilder()
+        .token(TOKEN)
         .build()
     )
 
+    # Registrar comandos.
     application.add_handler(
         CommandHandler("start", start)
     )
@@ -786,30 +890,37 @@ def main():
         CommandHandler("ayuda", ayuda)
     )
 
+    application.add_error_handler(error_handler)
+
+    # Crear y arrancar el ciclo de eventos.
+    event_loop = asyncio.new_event_loop()
+
     hilo = threading.Thread(
-        target=iniciar_loop,
+        target=ejecutar_event_loop,
+        args=(event_loop,),
         daemon=True
     )
 
     hilo.start()
 
-    import time
-    time.sleep(1)
-
-    future = asyncio.run_coroutine_threadsafe(
-        initialize_bot(),
-        loop
+    # Inicializar Telegram y configurar webhook.
+    futuro = asyncio.run_coroutine_threadsafe(
+        inicializar_bot(),
+        event_loop
     )
 
-    future.result(timeout=30)
+    futuro.result(timeout=60)
 
     logger.info(
-        "Iniciando Noticiero Mundial Express..."
+        "Noticiero Mundial Express iniciado correctamente."
     )
 
+    # Iniciar Flask.
     app.run(
         host="0.0.0.0",
-        port=PORT
+        port=PORT,
+        threaded=True,
+        use_reloader=False
     )
 
 
