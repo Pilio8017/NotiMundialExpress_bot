@@ -90,7 +90,7 @@ def limpiar_html(texto):
     if not texto:
         return ""
 
-    texto = re.sub(r"<[^>]+>", " ", texto)
+    texto = re.sub(r"<[^>]+>", " ", str(texto))
     texto = html.unescape(texto)
     texto = re.sub(r"\s+", " ", texto)
 
@@ -98,60 +98,82 @@ def limpiar_html(texto):
 
 
 # =========================================================
-# BUSCADOR DE IMÁGENES HTML
+# EXTRAER METADATOS DE LA NOTICIA
 # =========================================================
 
-class ImageParser(HTMLParser):
+class NewsImageParser(HTMLParser):
 
     def __init__(self):
         super().__init__()
+
         self.imagenes = []
+        self.jsonld_scripts = []
+
+        self.capturando_jsonld = False
+        self.jsonld_actual = []
 
     def handle_starttag(self, tag, attrs):
 
         atributos = dict(attrs)
+        tag = tag.lower()
 
-        if tag.lower() == "meta":
+        if tag == "meta":
 
             propiedad = (
                 atributos.get("property", "")
                 or atributos.get("name", "")
+                or atributos.get("itemprop", "")
             ).lower()
 
-            if propiedad in [
+            imagen = atributos.get("content")
+
+            if imagen and propiedad in [
                 "og:image",
                 "og:image:url",
                 "twitter:image",
                 "twitter:image:src",
+                "image",
             ]:
 
-                imagen = atributos.get("content")
+                self.imagenes.append({
+                    "url": imagen,
+                    "tipo": propiedad,
+                    "alt": atributos.get("alt", ""),
+                })
 
-                if imagen:
-                    self.imagenes.append(imagen)
+        elif tag == "script":
 
-        elif tag.lower() == "img":
+            tipo = atributos.get(
+                "type",
+                ""
+            ).lower()
 
-            imagen = (
-                atributos.get("data-src")
-                or atributos.get("data-original")
-                or atributos.get("data-lazy-src")
-                or atributos.get("src")
-            )
+            if "ld+json" in tipo:
 
-            if imagen:
-                self.imagenes.append(imagen)
+                self.capturando_jsonld = True
+                self.jsonld_actual = []
 
-            srcset = atributos.get("srcset")
+    def handle_data(self, data):
 
-            if srcset:
+        if self.capturando_jsonld:
+            self.jsonld_actual.append(data)
 
-                for parte in srcset.split(","):
+    def handle_endtag(self, tag):
 
-                    url = parte.strip().split(" ")[0]
+        if (
+            tag.lower() == "script"
+            and self.capturando_jsonld
+        ):
 
-                    if url:
-                        self.imagenes.append(url)
+            contenido = "".join(
+                self.jsonld_actual
+            ).strip()
+
+            if contenido:
+                self.jsonld_scripts.append(contenido)
+
+            self.capturando_jsonld = False
+            self.jsonld_actual = []
 
 
 # =========================================================
@@ -188,7 +210,7 @@ def descargar_url(url, timeout=12):
 
 
 # =========================================================
-# ABRIR PÁGINA ORIGINAL
+# ABRIR LA PUBLICACIÓN ORIGINAL
 # =========================================================
 
 def descargar_pagina_original(url, timeout=15):
@@ -199,7 +221,9 @@ def descargar_pagina_original(url, timeout=15):
             url,
             headers={
                 "User-Agent": USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,*/*",
+                "Accept": (
+                    "text/html,application/xhtml+xml,*/*"
+                ),
             },
         )
 
@@ -219,7 +243,7 @@ def descargar_pagina_original(url, timeout=15):
     except Exception as e:
 
         logger.warning(
-            "No se pudo abrir la página original: %s",
+            "No se pudo abrir la publicación: %s",
             e
         )
 
@@ -227,10 +251,35 @@ def descargar_pagina_original(url, timeout=15):
 
 
 # =========================================================
-# FILTRO DE IMÁGENES GENÉRICAS
+# IDENTIFICAR DOMINIOS DE GOOGLE
 # =========================================================
 
-def imagen_es_generica(url):
+def es_dominio_google(dominio):
+
+    dominio = dominio.lower().split(":")[0]
+
+    dominios_bloqueados = [
+        "google.com",
+        "googleusercontent.com",
+        "gstatic.com",
+        "googleapis.com",
+    ]
+
+    if dominio == "news.google.com":
+        return True
+
+    return any(
+        dominio == bloqueado
+        or dominio.endswith("." + bloqueado)
+        for bloqueado in dominios_bloqueados
+    )
+
+
+# =========================================================
+# FILTRAR LOGOS E IMÁGENES GENÉRICAS
+# =========================================================
+
+def imagen_es_generica(url, alt=""):
 
     try:
 
@@ -239,11 +288,17 @@ def imagen_es_generica(url):
         dominio = partes.netloc.lower()
         ruta = partes.path.lower()
 
-        # Bloquear el dominio del RSS de Google News,
-        # pero no otros servidores de Google.
-
-        if dominio == "news.google.com":
+        if not dominio:
             return True
+
+        if es_dominio_google(dominio):
+            return True
+
+        texto = (
+            ruta
+            + " "
+            + urllib.parse.unquote(alt).lower()
+        )
 
         palabras_bloqueadas = [
             "favicon",
@@ -252,15 +307,32 @@ def imagen_es_generica(url):
             "noimage",
             "default-avatar",
             "social-icon",
+            "site-logo",
+            "logo",
+            "brand",
+            "icon",
+            "avatar",
+            "banner",
+            "sprite",
+            "tracking",
+            "pixel",
+            "advertisement",
+            "ads-",
+            "loading",
+            "default-image",
         ]
 
         if any(
-            palabra in ruta
+            palabra in texto
             for palabra in palabras_bloqueadas
         ):
             return True
 
-        if ruta.endswith((".svg", ".ico")):
+        if ruta.endswith((
+            ".svg",
+            ".ico",
+            ".gif",
+        )):
             return True
 
         return False
@@ -275,53 +347,20 @@ def imagen_es_generica(url):
 
 def extraer_imagenes_rss(item):
 
-    candidatos = []
+    # No utilizamos las imágenes del RSS de Google News.
+    # Pueden ser logos, miniaturas genéricas o imágenes
+    # que no corresponden al artículo original.
 
-    for elemento in item.iter():
-
-        etiqueta = elemento.tag.lower()
-
-        if (
-            etiqueta.endswith("}content")
-            or etiqueta.endswith("}thumbnail")
-        ):
-
-            imagen = elemento.attrib.get("url")
-
-            if imagen:
-                candidatos.append(imagen)
-
-        if etiqueta.endswith("enclosure"):
-
-            imagen = elemento.attrib.get("url")
-            tipo = elemento.attrib.get("type", "")
-
-            if imagen and "image" in tipo.lower():
-                candidatos.append(imagen)
-
-    descripcion = ""
-
-    elemento_descripcion = item.find("description")
-
-    if elemento_descripcion is not None:
-        descripcion = elemento_descripcion.text or ""
-
-    parser = ImageParser()
-
-    try:
-        parser.feed(descripcion)
-        candidatos.extend(parser.imagenes)
-    except Exception:
-        pass
-
-    return candidatos
+    return []
 
 
 def consultar_rss(consulta, limite=5):
 
     noticias = []
 
-    consulta_codificada = urllib.parse.quote(consulta)
+    consulta_codificada = urllib.parse.quote(
+        consulta
+    )
 
     url = (
         "https://news.google.com/rss/search?q="
@@ -329,7 +368,10 @@ def consultar_rss(consulta, limite=5):
         "&hl=es-419&gl=CR&ceid=CR:es-419"
     )
 
-    contenido = descargar_url(url, timeout=15)
+    contenido = descargar_url(
+        url,
+        timeout=15
+    )
 
     if not contenido:
         return noticias
@@ -354,7 +396,10 @@ def consultar_rss(consulta, limite=5):
             elemento_fuente = item.find("source")
 
             if elemento_fuente is not None:
-                fuente = elemento_fuente.text or "Google News"
+                fuente = (
+                    elemento_fuente.text
+                    or "Google News"
+                )
 
             titulo = limpiar_html(titulo)
             descripcion = limpiar_html(descripcion)
@@ -368,7 +413,7 @@ def consultar_rss(consulta, limite=5):
                 "descripcion": descripcion,
                 "fuente": fuente,
                 "fecha": fecha,
-                "imagenes": extraer_imagenes_rss(item),
+                "imagenes": [],
             })
 
     except Exception as e:
@@ -379,6 +424,92 @@ def consultar_rss(consulta, limite=5):
         )
 
     return noticias
+
+
+# =========================================================
+# EXTRAER IMÁGENES DE JSON-LD
+# =========================================================
+
+def extraer_imagenes_jsonld(scripts):
+
+    imagenes = []
+
+    def recorrer(objeto):
+
+        if isinstance(objeto, dict):
+
+            for clave, valor in objeto.items():
+
+                if clave.lower() == "image":
+
+                    if isinstance(valor, str):
+
+                        imagenes.append({
+                            "url": valor,
+                            "tipo": "jsonld",
+                            "alt": "",
+                        })
+
+                    elif isinstance(valor, list):
+
+                        for elemento in valor:
+
+                            if isinstance(elemento, str):
+
+                                imagenes.append({
+                                    "url": elemento,
+                                    "tipo": "jsonld",
+                                    "alt": "",
+                                })
+
+                            elif isinstance(elemento, dict):
+
+                                url = (
+                                    elemento.get("url")
+                                    or elemento.get("contentUrl")
+                                )
+
+                                if url:
+                                    imagenes.append({
+                                        "url": url,
+                                        "tipo": "jsonld",
+                                        "alt": "",
+                                    })
+
+                    elif isinstance(valor, dict):
+
+                        url = (
+                            valor.get("url")
+                            or valor.get("contentUrl")
+                        )
+
+                        if url:
+                            imagenes.append({
+                                "url": url,
+                                "tipo": "jsonld",
+                                "alt": "",
+                            })
+
+                else:
+                    recorrer(valor)
+
+        elif isinstance(objeto, list):
+
+            for elemento in objeto:
+                recorrer(elemento)
+
+    for script in scripts:
+
+        try:
+
+            datos = json.loads(script)
+            recorrer(datos)
+
+        except Exception:
+
+            continue
+
+    return imagenes
 
 
 # =========================================================
@@ -395,7 +526,7 @@ def descargar_imagen(url):
                 "User-Agent": USER_AGENT,
                 "Accept": (
                     "image/avif,image/webp,image/apng,"
-                    "image/svg+xml,image/*,*/*;q=0.8"
+                    "image/*,*/*;q=0.8"
                 ),
             },
         )
@@ -409,7 +540,10 @@ def descargar_imagen(url):
                 MAX_IMAGE_BYTES + 1
             )
 
-            if not datos or len(datos) > MAX_IMAGE_BYTES:
+            if (
+                not datos
+                or len(datos) > MAX_IMAGE_BYTES
+            ):
                 return None
 
             return datos
@@ -428,9 +562,9 @@ def descargar_imagen(url):
 # VALIDAR FOTOGRAFÍA
 # =========================================================
 
-def descargar_fotografia_valida(url):
+def descargar_fotografia_valida(url, alt=""):
 
-    if imagen_es_generica(url):
+    if imagen_es_generica(url, alt):
         return None
 
     datos = descargar_imagen(url)
@@ -446,14 +580,19 @@ def descargar_fotografia_valida(url):
 
         ancho, alto = imagen.size
 
-        # Aceptar fotografías de diferentes tamaños.
-        if ancho < 100 or alto < 100:
+        # Evitar iconos, miniaturas diminutas y logos.
+        if ancho < 240 or alto < 160:
+            return None
+
+        proporcion = ancho / alto
+
+        if proporcion < 0.45 or proporcion > 3.5:
             return None
 
         imagen.verify()
 
         logger.info(
-            "Fotografía válida detectada: %s x %s",
+            "Fotografía válida: %s x %s",
             ancho,
             alto
         )
@@ -463,7 +602,7 @@ def descargar_fotografia_valida(url):
     except Exception as e:
 
         logger.info(
-            "Imagen descartada porque no es válida: %s",
+            "Imagen descartada: %s",
             e
         )
 
@@ -494,7 +633,10 @@ def preparar_imagen_telegram(datos):
             Image.Resampling.LANCZOS
         )
 
-        if imagen.mode in ("RGBA", "LA") or imagen.mode == "P":
+        if (
+            imagen.mode in ("RGBA", "LA")
+            or imagen.mode == "P"
+        ):
 
             imagen = imagen.convert("RGBA")
 
@@ -575,7 +717,7 @@ def preparar_imagen_telegram(datos):
 
 
 # =========================================================
-# BUSCAR FOTOGRAFÍA EN LA NOTICIA ORIGINAL
+# BUSCAR FOTOGRAFÍA EN LA PUBLICACIÓN ORIGINAL
 # =========================================================
 
 def buscar_imagen_original(noticia):
@@ -586,254 +728,143 @@ def buscar_imagen_original(noticia):
         enlace
     )
 
-    candidatos = []
-
-    if contenido:
-
-        try:
-
-            texto_html = contenido.decode(
-                "utf-8",
-                errors="replace"
-            )
-
-            parser = ImageParser()
-            parser.feed(texto_html)
-
-            # Primero las imágenes de la publicación.
-            candidatos.extend(parser.imagenes)
-
-        except Exception as e:
-
-            logger.warning(
-                "Error leyendo imágenes de la publicación: %s",
-                e
-            )
-
-    # Después revisar las imágenes disponibles en RSS.
-    candidatos.extend(
-        noticia.get("imagenes", [])
-    )
-
-    revisadas = set()
-
-    for imagen in candidatos:
-
-        if not imagen:
-            continue
-
-        imagen = html.unescape(
-            imagen.strip()
-        )
-
-        imagen = urllib.parse.urljoin(
-            url_final,
-            imagen
-        )
-
-        if imagen in revisadas:
-            continue
-
-        revisadas.add(imagen)
-
-        if not imagen.startswith(("http://", "https://")):
-            continue
-
-        if imagen_es_generica(imagen):
-            continue
-
+    if not contenido:
         logger.info(
-            "Probando fotografía: %s",
-            imagen[:180]
+            "No se pudo obtener el HTML de la noticia."
         )
-
-        datos = descargar_fotografia_valida(
-            imagen
-        )
-
-        if datos:
-
-            logger.info(
-                "Fotografía encontrada en la publicación original."
-            )
-
-            return datos
-
-    logger.info(
-        "No se encontró fotografía en la publicación original."
-    )
-
-    return None
-
-
-# =========================================================
-# BUSCAR IMÁGENES EN WIKIMEDIA COMMONS
-# =========================================================
-
-def buscar_imagen_commons(titulo):
-
-    api = "https://commons.wikimedia.org/w/api.php"
-
-    consulta = titulo
-
-    if " - " in consulta:
-        consulta = consulta.rsplit(" - ", 1)[0]
-
-    consulta = consulta.strip()[:180]
-
-    parametros = {
-        "action": "query",
-        "generator": "search",
-        "gsrsearch": consulta,
-        "gsrnamespace": "6",
-        "gsrlimit": "10",
-        "prop": "imageinfo",
-        "iiprop": "url|extmetadata",
-        "iiurlwidth": "1200",
-        "format": "json",
-    }
-
-    url = (
-        api
-        + "?"
-        + urllib.parse.urlencode(parametros)
-    )
+        return None
 
     try:
 
-        solicitud = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": (
-                    "NoticieroMundialExpress/1.0 "
-                    "(news image search)"
-                ),
-                "Accept": "application/json",
-            },
-        )
+        dominio_final = urllib.parse.urlparse(
+            url_final
+        ).netloc.lower()
 
-        with urllib.request.urlopen(
-            solicitud,
-            timeout=15
-        ) as respuesta:
+        # Si Google News no redirigió al medio original,
+        # no intentamos extraer imágenes de esa página.
 
-            resultado = json.loads(
-                respuesta.read().decode("utf-8")
-            )
-
-        paginas = (
-            resultado
-            .get("query", {})
-            .get("pages", {})
-        )
-
-        if not paginas:
-            return None
-
-        for pagina in paginas.values():
-
-            titulo_archivo = pagina.get(
-                "title",
-                ""
-            ).lower()
-
-            if any(
-                palabra in titulo_archivo
-                for palabra in [
-                    "logo",
-                    "icon",
-                    "favicon",
-                    "symbol",
-                    "default",
-                    "avatar",
-                    "placeholder",
-                ]
-            ):
-                continue
-
-            informacion = pagina.get(
-                "imageinfo",
-                []
-            )
-
-            if not informacion:
-                continue
-
-            info = informacion[0]
-
-            mime = info.get("mime", "").lower()
-
-            if mime not in [
-                "image/jpeg",
-                "image/png",
-                "image/webp",
-            ]:
-                continue
-
-            metadatos = info.get(
-                "extmetadata",
-                {}
-            )
-
-            licencia = limpiar_html(
-                metadatos.get(
-                    "LicenseShortName",
-                    {}
-                ).get("value", "Licencia Wikimedia")
-            )
-
-            autor = limpiar_html(
-                metadatos.get(
-                    "Artist",
-                    {}
-                ).get("value", "Autor no identificado")
-            )
-
-            pagina_archivo = (
-                "https://commons.wikimedia.org/wiki/"
-                + urllib.parse.quote(
-                    pagina.get("title", "").replace(" ", "_"),
-                    safe=":"
-                )
-            )
-
-            url_imagen = (
-                info.get("thumburl")
-                or info.get("url")
-            )
-
-            if not url_imagen:
-                continue
-
-            datos = descargar_fotografia_valida(
-                url_imagen
-            )
-
-            if not datos:
-                continue
-
-            credito = (
-                f"📷 Imagen: {autor} | {licencia}\n"
-                f"🔗 {pagina_archivo}"
-            )
+        if (
+            not dominio_final
+            or es_dominio_google(dominio_final)
+        ):
 
             logger.info(
-                "Imagen alternativa encontrada en Wikimedia Commons."
+                "El enlace sigue en Google News. "
+                "No se utilizará su imagen."
             )
 
-            return {
-                "datos": datos,
-                "credito": credito,
-            }
+            return None
+
+        texto_html = contenido.decode(
+            "utf-8",
+            errors="replace"
+        )
+
+        parser = NewsImageParser()
+        parser.feed(texto_html)
+
+        candidatos = []
+
+        # Primero metadatos Open Graph.
+        for imagen in parser.imagenes:
+
+            if imagen["tipo"] in [
+                "og:image",
+                "og:image:url",
+            ]:
+
+                candidatos.append(imagen)
+
+        # Después metadatos de Twitter.
+        for imagen in parser.imagenes:
+
+            if imagen["tipo"] in [
+                "twitter:image",
+                "twitter:image:src",
+            ]:
+
+                candidatos.append(imagen)
+
+        # Finalmente datos estructurados JSON-LD.
+        candidatos.extend(
+            extraer_imagenes_jsonld(
+                parser.jsonld_scripts
+            )
+        )
+
+        revisadas = set()
+
+        for candidato in candidatos:
+
+            imagen = candidato.get("url", "")
+            alt = candidato.get("alt", "")
+
+            if not imagen:
+                continue
+
+            imagen = html.unescape(
+                imagen.strip()
+            )
+
+            imagen = urllib.parse.urljoin(
+                url_final,
+                imagen
+            )
+
+            if imagen in revisadas:
+                continue
+
+            revisadas.add(imagen)
+
+            if not imagen.startswith((
+                "http://",
+                "https://"
+            )):
+                continue
+
+            if imagen_es_generica(
+                imagen,
+                alt
+            ):
+                logger.info(
+                    "Imagen descartada por ser genérica."
+                )
+                continue
+
+            logger.info(
+                "Revisando imagen principal: %s",
+                imagen[:180]
+            )
+
+            datos = descargar_fotografia_valida(
+                imagen,
+                alt
+            )
+
+            if datos:
+
+                logger.info(
+                    "Fotografía obtenida de metadatos "
+                    "de la publicación original."
+                )
+
+                return datos
+
+        logger.info(
+            "La publicación no ofrece una fotografía "
+            "principal válida."
+        )
+
+        return None
 
     except Exception as e:
 
-        logger.warning(
-            "Error buscando imágenes en Wikimedia Commons: %s",
+        logger.exception(
+            "Error extrayendo imagen de la noticia: %s",
             e
         )
 
-    return None
+        return None
 
 
 # =========================================================
@@ -856,18 +887,8 @@ def buscar_fotografia(noticia):
         }
 
     logger.info(
-        "Buscando fotografía alternativa en Wikimedia Commons."
-    )
-
-    imagen_alternativa = buscar_imagen_commons(
-        noticia["titulo"]
-    )
-
-    if imagen_alternativa:
-        return imagen_alternativa
-
-    logger.info(
-        "No se encontró una fotografía disponible."
+        "No se encontró una fotografía confiable. "
+        "La noticia se enviará sin imagen."
     )
 
     return None
@@ -885,8 +906,11 @@ def generar_resumen(titulo, descripcion, fuente):
             "No está configurada GEMINI_API_KEY."
         )
 
-        return descripcion[:450] if descripcion else (
-            "No hay información suficiente para generar el resumen."
+        return (
+            descripcion[:450]
+            if descripcion
+            else "No hay información suficiente "
+                 "para generar el resumen."
         )
 
     instruccion = (
@@ -950,8 +974,10 @@ def generar_resumen(titulo, descripcion, fuente):
 
         if not candidatos:
 
-            return descripcion[:450] if descripcion else (
-                "No fue posible generar el resumen."
+            return (
+                descripcion[:450]
+                if descripcion
+                else "No fue posible generar el resumen."
             )
 
         partes = (
@@ -968,8 +994,10 @@ def generar_resumen(titulo, descripcion, fuente):
         if resumen:
             return resumen
 
-        return descripcion[:450] if descripcion else (
-            "No fue posible generar el resumen."
+        return (
+            descripcion[:450]
+            if descripcion
+            else "No fue posible generar el resumen."
         )
 
     except urllib.error.HTTPError as e:
@@ -991,8 +1019,10 @@ def generar_resumen(titulo, descripcion, fuente):
             detalle
         )
 
-        return descripcion[:450] if descripcion else (
-            "No fue posible generar el resumen."
+        return (
+            descripcion[:450]
+            if descripcion
+            else "No fue posible generar el resumen."
         )
 
     except Exception as e:
@@ -1002,8 +1032,10 @@ def generar_resumen(titulo, descripcion, fuente):
             e
         )
 
-        return descripcion[:450] if descripcion else (
-            "No fue posible generar el resumen."
+        return (
+            descripcion[:450]
+            if descripcion
+            else "No fue posible generar el resumen."
         )
 
 
@@ -1051,7 +1083,11 @@ def crear_mensaje(noticia, resumen, credito=None):
 # ENVIAR FOTOGRAFÍA Y TEXTO
 # =========================================================
 
-async def enviar_fotografia_y_texto(chat, fotografia, mensaje):
+async def enviar_fotografia_y_texto(
+    chat,
+    fotografia,
+    mensaje
+):
 
     imagen_jpg = await asyncio.to_thread(
         preparar_imagen_telegram,
@@ -1061,7 +1097,8 @@ async def enviar_fotografia_y_texto(chat, fotografia, mensaje):
     if not imagen_jpg:
 
         logger.warning(
-            "La imagen no pudo convertirse. Se enviará solo el texto."
+            "La imagen no pudo convertirse. "
+            "Se enviará solo el texto."
         )
 
         await chat.send_message(
@@ -1090,7 +1127,7 @@ async def enviar_fotografia_y_texto(chat, fotografia, mensaje):
             )
 
             logger.info(
-                "Fotografía enviada correctamente con su descripción."
+                "Fotografía enviada correctamente."
             )
 
             return True
@@ -1126,7 +1163,7 @@ async def enviar_fotografia_y_texto(chat, fotografia, mensaje):
             except Exception as segundo_error:
 
                 logger.exception(
-                    "FALLO AL ENVIAR FOTOGRAFÍA SIN CAPTION: %s",
+                    "FALLO AL ENVIAR FOTOGRAFÍA: %s",
                     segundo_error
                 )
 
@@ -1279,7 +1316,7 @@ async def enviar_noticias(update, titulo, consulta):
                     )
 
                     logger.info(
-                        "Noticia %s enviada sin fotografía disponible.",
+                        "Noticia %s enviada sin fotografía confiable.",
                         numero
                     )
 
@@ -1329,7 +1366,10 @@ async def enviar_noticias(update, titulo, consulta):
 # COMANDOS
 # =========================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     mensaje = (
         "🌎 <b>¡Bienvenido a Noticiero Mundial Express!</b>\n\n"
@@ -1342,7 +1382,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚽ /deportes - Noticias deportivas\n"
         "ℹ️ /ayuda - Información del bot\n\n"
         "Cada noticia incluye, cuando está disponible, "
-        "una fotografía, un resumen y el enlace a su fuente."
+        "una fotografía original, un resumen y el enlace "
+        "a su fuente."
     )
 
     await update.message.reply_text(
@@ -1351,7 +1392,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def noticias(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     await enviar_noticias(
         update,
@@ -1360,7 +1404,10 @@ async def noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cine(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cine(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     await enviar_noticias(
         update,
@@ -1369,7 +1416,10 @@ async def cine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def mercados(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def mercados(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     await enviar_noticias(
         update,
@@ -1378,7 +1428,10 @@ async def mercados(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def deportes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def deportes(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     await enviar_noticias(
         update,
@@ -1387,7 +1440,10 @@ async def deportes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ayuda(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     mensaje = (
         "ℹ️ <b>AYUDA - NOTICIERO MUNDIAL EXPRESS</b>\n\n"
@@ -1400,7 +1456,9 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/ayuda - Mostrar esta información\n\n"
         "Las noticias provienen de Google News. "
         "Los resúmenes se generan con inteligencia artificial "
-        "cuando el servicio está disponible."
+        "cuando el servicio está disponible. "
+        "Las fotografías se muestran cuando la publicación "
+        "original ofrece una imagen identificable."
     )
 
     await update.message.reply_text(
